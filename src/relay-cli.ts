@@ -115,9 +115,9 @@ function loadTunnelDefinitions(
       ? value.trim()
       : value.tunnelId?.trim();
 
-    if (!tunnelId || !/^tunnel_[0-9a-f]{32}$/.test(tunnelId)) {
+    if (!tunnelId || !/^tunnel_[a-z0-9][a-z0-9_-]{0,63}$/.test(tunnelId)) {
       throw new Error(
-        `tunnels.${slug} must be a tunnel ID matching tunnel_ + 32 lowercase hex chars`,
+        `tunnels.${slug} must be a tunnel ID like tunnel_lisa`,
       );
     }
 

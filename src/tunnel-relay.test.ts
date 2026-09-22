@@ -45,11 +45,11 @@ const config: ServerConfig = {
 const tunnels: TunnelDefinition[] = [
   {
     slug: "lisa",
-    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    tunnelId: "tunnel_lisa",
   },
   {
     slug: "10236",
-    tunnelId: "tunnel_fedcba9876543210fedcba9876543210",
+    tunnelId: "tunnel_10236",
   },
 ];
 
@@ -86,7 +86,7 @@ try {
   }
 
   const wrong = await fetch(
-    `${tunnelBase}/v1/tunnels/tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+    `${tunnelBase}/v1/tunnels/tunnel_unknown`,
     {
       headers: { authorization: `Bearer ${config.relay.tunnelToken}` },
     },

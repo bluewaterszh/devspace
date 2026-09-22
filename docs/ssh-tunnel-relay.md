@@ -43,8 +43,8 @@ No per-device ports are used.
     "publicBaseUrl": "https://www.astmars.com:8551"
   },
   "tunnels": {
-    "lisa": "tunnel_0123456789abcdef0123456789abcdef",
-    "10236": "tunnel_fedcba9876543210fedcba9876543210"
+    "lisa": "tunnel_lisa",
+    "10236": "tunnel_10236"
   },
   "storage": {
     "stateDir": "/var/lib/devspace-relay"

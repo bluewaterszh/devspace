@@ -1,8 +1,10 @@
+import { chmodSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import Database from "better-sqlite3";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import { InvalidRequestError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { openSqliteDatabase, type SqliteDatabaseHandle } from "./db/sqlite.js";
 
 export interface PersistedAccessTokenRecord {
   clientId: string;
@@ -25,32 +27,28 @@ export interface PersistedTokenPair {
   refreshToken: PersistedRefreshTokenRecord;
 }
 
-function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(redirectUri);
-  } catch {
-    return false;
-  }
-
-  if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
-  return allowedHosts.includes(parsed.hostname);
-}
-
 export class SqliteOAuthStore {
-  private readonly database: SqliteDatabaseHandle;
+  private readonly sqlite: Database.Database;
 
   constructor(stateDir: string) {
-    this.database = openSqliteDatabase(stateDir);
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    chmodSync(stateDir, 0o700);
+    const path = join(stateDir, "oauth.sqlite");
+    this.sqlite = new Database(path);
+    chmodSync(path, 0o600);
+    this.sqlite.pragma("journal_mode = WAL");
+    this.sqlite.pragma("synchronous = NORMAL");
+    this.sqlite.pragma("busy_timeout = 5000");
+    this.sqlite.pragma("foreign_keys = ON");
+    this.ensureSchema();
     this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
   }
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
-    const row = this.database.sqlite
+    const row = this.sqlite
       .prepare("select client_json from oauth_clients where client_id = ?")
       .get(clientId) as { client_json: string } | undefined;
-
-    return row ? (JSON.parse(row.client_json) as OAuthClientInformationFull) : undefined;
+    return row ? JSON.parse(row.client_json) as OAuthClientInformationFull : undefined;
   }
 
   registerClient(
@@ -71,119 +69,107 @@ export class SqliteOAuthStore {
       response_types: client.response_types ?? ["code"],
     };
 
-    this.database.sqlite
+    this.sqlite
       .prepare("insert into oauth_clients (client_id, client_json, issued_at) values (?, ?, ?)")
       .run(registered.client_id, JSON.stringify(registered), now);
-
     return registered;
   }
 
-  saveAccessToken(tokenHash: string, record: PersistedAccessTokenRecord): void {
-    this.database.sqlite
-      .prepare(
-        `insert into oauth_access_tokens (token_hash, client_id, scopes_json, expires_at, resource)
-         values (?, ?, ?, ?, ?)
-         on conflict(token_hash) do update set
-           client_id = excluded.client_id,
-           scopes_json = excluded.scopes_json,
-           expires_at = excluded.expires_at,
-           resource = excluded.resource`,
-      )
-      .run(
-        tokenHash,
-        record.clientId,
-        JSON.stringify(record.scopes),
-        record.expiresAt,
-        record.resource ?? null,
-      );
+  getAccessToken(tokenHash: string): PersistedAccessTokenRecord | undefined {
+    const row = this.sqlite.prepare(
+      "select client_id, scopes_json, expires_at, resource from oauth_access_tokens where token_hash = ?",
+    ).get(tokenHash) as TokenRow | undefined;
+    return row ? rowToTokenRecord(row) : undefined;
   }
 
-  getAccessToken(tokenHash: string): PersistedAccessTokenRecord | undefined {
-    const row = this.database.sqlite
-      .prepare(
-        "select client_id, scopes_json, expires_at, resource from oauth_access_tokens where token_hash = ?",
-      )
-      .get(tokenHash) as
-      | {
-          client_id: string;
-          scopes_json: string;
-          expires_at: number;
-          resource: string | null;
-        }
-      | undefined;
-
-    return row ? rowToAccessTokenRecord(row) : undefined;
+  getRefreshToken(tokenHash: string): PersistedRefreshTokenRecord | undefined {
+    const row = this.sqlite.prepare(
+      "select client_id, scopes_json, expires_at, resource from oauth_refresh_tokens where token_hash = ?",
+    ).get(tokenHash) as TokenRow | undefined;
+    return row ? rowToTokenRecord(row) : undefined;
   }
 
   deleteAccessToken(tokenHash: string): void {
-    this.database.sqlite.prepare("delete from oauth_access_tokens where token_hash = ?").run(tokenHash);
+    this.sqlite.prepare("delete from oauth_access_tokens where token_hash = ?").run(tokenHash);
   }
 
-  saveRefreshToken(tokenHash: string, record: PersistedRefreshTokenRecord): void {
-    this.database.sqlite
-      .prepare(
-        `insert into oauth_refresh_tokens (token_hash, client_id, scopes_json, expires_at, resource)
-         values (?, ?, ?, ?, ?)
-         on conflict(token_hash) do update set
-           client_id = excluded.client_id,
-           scopes_json = excluded.scopes_json,
-           expires_at = excluded.expires_at,
-           resource = excluded.resource`,
-      )
-      .run(
-        tokenHash,
-        record.clientId,
-        JSON.stringify(record.scopes),
-        record.expiresAt,
-        record.resource ?? null,
-      );
+  deleteRefreshToken(tokenHash: string): void {
+    this.sqlite.prepare("delete from oauth_refresh_tokens where token_hash = ?").run(tokenHash);
   }
 
   saveTokenPair(pair: PersistedTokenPair, consumedRefreshTokenHash?: string): boolean {
-    const save = this.database.sqlite.transaction(() => {
+    const save = this.sqlite.transaction(() => {
       if (consumedRefreshTokenHash) {
-        const result = this.database.sqlite
+        const result = this.sqlite
           .prepare("delete from oauth_refresh_tokens where token_hash = ?")
           .run(consumedRefreshTokenHash);
         if (result.changes !== 1) return false;
       }
 
-      this.saveAccessToken(pair.accessTokenHash, pair.accessToken);
-      this.saveRefreshToken(pair.refreshTokenHash, pair.refreshToken);
+      this.saveToken("oauth_access_tokens", pair.accessTokenHash, pair.accessToken);
+      this.saveToken("oauth_refresh_tokens", pair.refreshTokenHash, pair.refreshToken);
       return true;
     });
-
     return save.immediate();
   }
 
-  getRefreshToken(tokenHash: string): PersistedRefreshTokenRecord | undefined {
-    const row = this.database.sqlite
-      .prepare(
-        "select client_id, scopes_json, expires_at, resource from oauth_refresh_tokens where token_hash = ?",
-      )
-      .get(tokenHash) as
-      | {
-          client_id: string;
-          scopes_json: string;
-          expires_at: number;
-          resource: string | null;
-        }
-      | undefined;
-
-    return row ? rowToRefreshTokenRecord(row) : undefined;
-  }
-
-  deleteRefreshToken(tokenHash: string): void {
-    this.database.sqlite.prepare("delete from oauth_refresh_tokens where token_hash = ?").run(tokenHash);
-  }
-
   close(): void {
-    this.database.close();
+    this.sqlite.close();
+  }
+
+  private saveToken(
+    table: "oauth_access_tokens" | "oauth_refresh_tokens",
+    tokenHash: string,
+    record: PersistedAccessTokenRecord | PersistedRefreshTokenRecord,
+  ): void {
+    this.sqlite.prepare(
+      `insert into ${table} (token_hash, client_id, scopes_json, expires_at, resource)
+       values (?, ?, ?, ?, ?)
+       on conflict(token_hash) do update set
+         client_id = excluded.client_id,
+         scopes_json = excluded.scopes_json,
+         expires_at = excluded.expires_at,
+         resource = excluded.resource`,
+    ).run(
+      tokenHash,
+      record.clientId,
+      JSON.stringify(record.scopes),
+      record.expiresAt,
+      record.resource ?? null,
+    );
+  }
+
+  private ensureSchema(): void {
+    this.sqlite.exec(`
+      create table if not exists oauth_clients (
+        client_id text primary key,
+        client_json text not null,
+        issued_at integer not null
+      );
+      create table if not exists oauth_access_tokens (
+        token_hash text primary key,
+        client_id text not null,
+        scopes_json text not null,
+        expires_at integer not null,
+        resource text
+      );
+      create index if not exists oauth_access_tokens_expires_at_idx
+        on oauth_access_tokens(expires_at);
+      create table if not exists oauth_refresh_tokens (
+        token_hash text primary key,
+        client_id text not null,
+        scopes_json text not null,
+        expires_at integer not null,
+        resource text
+      );
+      create index if not exists oauth_refresh_tokens_expires_at_idx
+        on oauth_refresh_tokens(expires_at);
+    `);
   }
 
   private deleteExpiredTokens(nowSeconds: number): void {
-    this.database.sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
-    this.database.sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
+    this.sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
+    this.sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
   }
 }
 
@@ -204,12 +190,14 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   }
 }
 
-function rowToAccessTokenRecord(row: {
+interface TokenRow {
   client_id: string;
   scopes_json: string;
   expires_at: number;
   resource: string | null;
-}): PersistedAccessTokenRecord {
+}
+
+function rowToTokenRecord(row: TokenRow): PersistedAccessTokenRecord {
   return {
     clientId: row.client_id,
     scopes: JSON.parse(row.scopes_json) as string[],
@@ -218,16 +206,13 @@ function rowToAccessTokenRecord(row: {
   };
 }
 
-function rowToRefreshTokenRecord(row: {
-  client_id: string;
-  scopes_json: string;
-  expires_at: number;
-  resource: string | null;
-}): PersistedRefreshTokenRecord {
-  return {
-    clientId: row.client_id,
-    scopes: JSON.parse(row.scopes_json) as string[],
-    expiresAt: row.expires_at,
-    resource: row.resource ?? undefined,
-  };
+function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    return false;
+  }
+  if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
+  return allowedHosts.includes(parsed.hostname);
 }

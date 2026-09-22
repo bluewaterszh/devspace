@@ -1,0 +1,11 @@
+# Append these blocks to /etc/caddy/Caddyfile on Lisa.
+
+https://www.astmars.com:8550 {
+        tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
+        reverse_proxy 127.0.0.1:18550
+}
+
+https://www.astmars.com:8551 {
+        tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
+        reverse_proxy 127.0.0.1:18551
+}

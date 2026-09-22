@@ -1,64 +1,92 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultDevspaceConfig } from "./config-schema.js";
-import { loadTunnelRelayOptions } from "./tunnel-relay.js";
-import {
-  devspaceAuthPath,
-  devspaceConfigPath,
-  writeDevspaceAuth,
-  writeDevspaceConfig,
-} from "./user-config.js";
+import type { Server } from "node:http";
+import type { ServerConfig } from "./config.js";
+import { createRelayApplications } from "./tunnel-relay.js";
 
-const configDir = mkdtempSync(join(tmpdir(), "devspace-tunnel-relay-test-"));
-const env = { DEVSPACE_CONFIG_DIR: configDir };
-
-try {
-  const config = defaultDevspaceConfig();
-  config.relay.tunnelId = "tunnel_0123456789abcdef0123456789abcdef";
-  config.relay.name = "SSH-238";
-  config.relay.description = "SSH relay for 238";
-  config.relay.responseTimeoutMs = 91_000;
-  config.relay.maxPollWaitMs = 17_000;
-  writeDevspaceConfig(config, env);
-  writeDevspaceAuth({
-    ownerToken: "test-only-owner-value-123456",
-    tunnelToken: "test-only-relay-secret-123456",
-  }, env);
-
-  assert.deepEqual(loadTunnelRelayOptions(env), {
+const stateDir = mkdtempSync(join(tmpdir(), "devspace-relay-state-"));
+const config: ServerConfig = {
+  configDir: stateDir,
+  openai: {
+    host: "127.0.0.1",
+    port: 18550,
+    publicBaseUrl: "http://127.0.0.1:18550",
+    allowedHosts: ["127.0.0.1"],
+    trustProxy: false,
+  },
+  tunnel: {
+    host: "127.0.0.1",
+    port: 18551,
+    publicBaseUrl: "http://127.0.0.1:18551",
+    allowedHosts: ["127.0.0.1"],
+    trustProxy: false,
+  },
+  stateDir,
+  oauth: {
+    ownerToken: "owner-secret-value-123456",
+    accessTokenTtlSeconds: 3600,
+    refreshTokenTtlSeconds: 86400,
+    scopes: ["devspace"],
+    allowedResourceUrls: [],
+    allowedRedirectHosts: ["localhost", "127.0.0.1", "chatgpt.com"],
+  },
+  relay: {
     tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
-    tunnelToken: "test-only-relay-secret-123456",
-    name: "SSH-238",
-    description: "SSH relay for 238",
-    responseTimeoutMs: 91_000,
-    maxPollWaitMs: 17_000,
-  });
+    tunnelToken: "tunnel-secret-value-123456",
+    name: "Lisa",
+    description: "test",
+    responseTimeoutMs: 10000,
+    maxPollWaitMs: 1000,
+  },
+};
 
-  const configSource = readFileSync(devspaceConfigPath(env), "utf8");
-  const authSource = readFileSync(devspaceAuthPath(env), "utf8");
-  assert.doesNotMatch(configSource, /test-only-relay-secret-123456/);
-  assert.match(authSource, /test-only-relay-secret-123456/);
+const apps = createRelayApplications(config);
+const openai = await listen(apps.openaiApp);
+const tunnel = await listen(apps.tunnelApp);
+try {
+  const openaiBase = base(openai);
+  const tunnelBase = base(tunnel);
 
-  assert.deepEqual(loadTunnelRelayOptions({
-    ...env,
-    DEVSPACE_RELAY_TUNNEL_ID: "tunnel_fedcba9876543210fedcba9876543210",
-    DEVSPACE_RELAY_TUNNEL_TOKEN: "test-only-env-secret-123456",
-    DEVSPACE_RELAY_TUNNEL_NAME: "env-name",
-    DEVSPACE_RELAY_TUNNEL_DESCRIPTION: "env-description",
-    DEVSPACE_RELAY_RESPONSE_TIMEOUT_MS: "12345",
-    DEVSPACE_RELAY_MAX_POLL_WAIT_MS: "6789",
-  }), {
-    tunnelId: "tunnel_fedcba9876543210fedcba9876543210",
-    tunnelToken: "test-only-env-secret-123456",
-    name: "env-name",
-    description: "env-description",
-    responseTimeoutMs: 12_345,
-    maxPollWaitMs: 6_789,
+  assert.equal((await fetch(`${openaiBase}/healthz`)).status, 200);
+  assert.equal((await fetch(`${openaiBase}/v1/tunnels/${config.relay.tunnelId}`)).status, 404);
+
+  assert.equal((await fetch(`${tunnelBase}/healthz`)).status, 200);
+  assert.equal((await fetch(`${tunnelBase}/mcp`, { method: "POST" })).status, 404);
+  assert.equal(
+    (await fetch(`${tunnelBase}/v1/tunnels/${config.relay.tunnelId}`)).status,
+    401,
+  );
+  const control = await fetch(`${tunnelBase}/v1/tunnels/${config.relay.tunnelId}`, {
+    headers: { authorization: `Bearer ${config.relay.tunnelToken}` },
   });
+  assert.equal(control.status, 200);
+  assert.equal((await control.json() as { id: string }).id, config.relay.tunnelId);
 } finally {
-  rmSync(configDir, { recursive: true, force: true });
+  await Promise.all([close(openai), close(tunnel)]);
+  await apps.close();
+  rmSync(stateDir, { recursive: true, force: true });
 }
 
-console.log("tunnel relay config tests passed");
+console.log("relay surface tests passed");
+
+function listen(app: { listen(port: number, host: string): Server }): Promise<Server> {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(0, "127.0.0.1");
+    server.once("listening", () => resolve(server));
+    server.once("error", reject);
+  });
+}
+
+function base(server: Server): string {
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("missing address");
+  return `http://127.0.0.1:${address.port}`;
+}
+
+function close(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+}

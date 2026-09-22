@@ -1,167 +1,124 @@
-# SSH tunnel relay mode
+# SSH tunnel relay
 
-This fork adds an SSH-only relay mode that reuses DevSpace OAuth while keeping
-the target SSH MCP server private.
-
-The first version intentionally binds one public MCP endpoint to one
-`tunnel_id`. Run one relay instance per ChatGPT plugin / SSH target.
-
-## End-to-end layout
+## Architecture
 
 ```text
-ChatGPT
+ChatGPT / OpenAI
   |
-  | HTTPS + DevSpace OAuth
+  | HTTPS :8550
+  | DevSpace OAuth
   v
-https://mcp-238.example.com/mcp
+Caddy
   |
-  | in-memory request queue
   v
-DevSpace relay (public server)
+127.0.0.1:18550
+  |
+  | /mcp + OAuth endpoints only
+  v
+DevSpace relay
   ^
-  | GET  /v1/tunnels/<id>/poll
-  | POST /v1/tunnels/<id>/response
-  | Bearer <relay tunnel token>
+  | shared in-memory request queue
   |
-OpenAI tunnel-client.exe (Windows)
+127.0.0.1:18551
+  ^
+  | /v1/tunnels/... only
+  | tunnel bearer token
   |
-  | http://127.0.0.1:3006/
+Caddy
+  ^
+  | HTTPS :8551
+  |
+Windows tunnel-client.exe
+  |
   v
-ssh-mcp-238
-  |
-  | SSH
-  v
-target server
+local ssh-mcp -> SSH target
 ```
 
-ChatGPT uses **Server URL** mode, not OpenAI Tunnel mode. The `tunnel_id`
-exists only between this relay and `tunnel-client.exe`.
+The OpenAI and Windows surfaces are separate application listeners. OAuth endpoints are not mounted on the Windows listener, and tunnel-control endpoints are not mounted on the OpenAI listener.
 
-## Public relay configuration
+## Configuration
 
-Use the normal DevSpace setup for OAuth:
-
-```bash
-corepack pnpm install
-corepack pnpm build
-devspace init
-devspace config set publicBaseUrl https://mcp-238.example.com
-```
-
-Persist the relay metadata in `~/.devspace/config.jsonc`. The tunnel id,
-display name, description, and timeout tuning are not secrets:
+`~/.devspace/config.jsonc` contains only non-secret settings:
 
 ```jsonc
 {
-  // ...normal DevSpace settings...
-  "relay": {
+  "openai": {
+    "host": "127.0.0.1",
+    "port": 18550,
+    "publicBaseUrl": "https://www.astmars.com:8550",
+    "allowedHosts": ["www.astmars.com"],
+    "trustProxy": true
+  },
+  "tunnel": {
+    "host": "127.0.0.1",
+    "port": 18551,
+    "publicBaseUrl": "https://www.astmars.com:8551",
+    "allowedHosts": ["www.astmars.com"],
+    "trustProxy": true,
     "tunnelId": "tunnel_0123456789abcdef0123456789abcdef",
-    "name": "SSH-238",
-    "description": "SSH MCP relay for 238",
+    "name": "Lisa SSH relay",
+    "description": "Windows SSH MCP relay via Lisa",
     "responseTimeoutMs": 120000,
     "maxPollWaitMs": 30000
+  },
+  "storage": {
+    "stateDir": "/var/lib/devspace-relay"
+  },
+  "oauth": {
+    "accessTokenTtlSeconds": 3600,
+    "refreshTokenTtlSeconds": 2592000,
+    "scopes": ["devspace"],
+    "allowedResourceUrls": [],
+    "allowedRedirectHosts": ["chatgpt.com", "localhost", "127.0.0.1"]
   }
 }
 ```
 
-Persist the shared tunnel secret separately in `~/.devspace/auth.json`:
+`~/.devspace/auth.json` contains secrets and must be mode `0600`:
 
 ```json
 {
-  "ownerToken": "<existing-devspace-owner-password>",
-  "tunnelToken": "<long-random-secret>"
+  "ownerToken": "<owner-password>",
+  "tunnelToken": "<long-random-tunnel-secret>"
 }
-```
-
-`devspace init --force` preserves an existing `tunnelToken` and generates
-one when it is absent. The file is written with mode `0600`.
-
-Then start the relay:
-
-```bash
-devspace relay
-```
-
-The old `DEVSPACE_RELAY_*` variables remain optional process-level overrides,
-but they are no longer required for normal startup.
-
-The public MCP URL is:
-
-```text
-https://mcp-238.example.com/mcp
-```
-
-The tunnel-client control-plane base URL is the host root:
-
-```text
-https://mcp-238.example.com
 ```
 
 ## Windows tunnel-client
 
-The existing OpenAI tunnel client can use a private control-plane host. Point
-it at the DevSpace relay instead of `api.openai.com`:
-
-```bash
-export CONTROL_PLANE_BASE_URL=https://mcp-238.example.com
-export CONTROL_PLANE_TUNNEL_ID='tunnel_0123456789abcdef0123456789abcdef'
-export CONTROL_PLANE_API_KEY='<same-relay-tunnel-token>'
-
-tunnel-client.exe run \
-  --mcp.server-url=http://127.0.0.1:3006/ \
-  --health.listen-addr=127.0.0.1:8086 \
-  --log.level=info
-```
-
-If ssh-mcp itself requires a bearer token, keep using tunnel-client's
-`--mcp.extra-headers` mechanism. The ChatGPT OAuth bearer token is terminated
-at the public relay and is not forwarded to ssh-mcp.
-
-## Relay endpoints
-
-ChatGPT-facing:
+Use the Windows-side control plane URL:
 
 ```text
-POST   /mcp
-DELETE /mcp
+CONTROL_PLANE_BASE_URL=https://www.astmars.com:8551
+CONTROL_PLANE_TUNNEL_ID=<tunnelId from config.jsonc>
+CONTROL_PLANE_API_KEY=<tunnelToken from auth.json>
 ```
 
-OAuth discovery, dynamic client registration, authorization, token issuance,
-refresh tokens, and Owner Password approval are provided by the existing
-DevSpace OAuth implementation.
+Then point tunnel-client at the local ssh-mcp endpoint as before.
 
-Tunnel-client-facing:
+## ChatGPT / OpenAI
+
+Use this MCP server URL:
 
 ```text
-GET  /v1/tunnels/<tunnel_id>
-GET  /v1/tunnels/<tunnel_id>/poll
-POST /v1/tunnels/<tunnel_id>/response
+https://www.astmars.com:8550/mcp
 ```
 
-The control-plane routes require:
+ChatGPT performs OAuth against the same `:8550` origin. The Owner password is `ownerToken` from `auth.json`.
 
-```http
-Authorization: Bearer <tunnelToken from ~/.devspace/auth.json>
+## Caddy
+
+The Lisa deployment uses two TLS listeners:
+
+```caddy
+https://www.astmars.com:8550 {
+    tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
+    reverse_proxy 127.0.0.1:18550
+}
+
+https://www.astmars.com:8551 {
+    tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
+    reverse_proxy 127.0.0.1:18551
+}
 ```
 
-The relay implements the public OpenAI tunnel-client wire contract needed for
-JSON-RPC commands, session termination, response correlation, and SSE
-notifications.
-
-## One plugin per SSH server
-
-Do not multiplex targets through a `target` tool argument. For another
-server, run a separate relay instance with a separate public URL, local port,
-state directory, tunnel id, and tunnel token.
-
-Example conceptual mapping:
-
-```text
-SSH-238 plugin -> mcp-238.example.com -> tunnel_A -> ssh-mcp-238
-SSH-155 plugin -> mcp-155.example.com -> tunnel_B -> ssh-mcp-155
-```
-
-This keeps the target identity fixed at plugin creation time.
-
-For multiple relay processes on one public host, use separate
-`DEVSPACE_CONFIG_DIR` values and ports, then route each hostname with Caddy.
+The existing `https://www.astmars.com/` site on port 443 is unchanged.

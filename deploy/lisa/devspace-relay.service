@@ -1,0 +1,22 @@
+[Unit]
+Description=DevSpace Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/devspace
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=128
+ExecStart=/root/.local/node-v22.22.0-linux-x64/bin/node /root/devspace/dist/relay-cli.js
+Restart=on-failure
+RestartSec=3
+Nice=5
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

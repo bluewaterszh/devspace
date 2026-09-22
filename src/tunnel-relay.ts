@@ -149,7 +149,10 @@ class TunnelRelayState {
     if (responseType === "jsonrpc_notify") {
       if (payload.resp_json === undefined) return "invalid_payload";
       if (pending.acceptsSse) {
-        if (!pending.sseStarted) startSse(pending.response);
+        if (!pending.sseStarted) {
+          applyResponseHeaders(pending.response, responseHeaders(payload.resp_headers));
+          startSse(pending.response);
+        }
         pending.sseStarted = true;
         writeSse(pending.response, payload.resp_json);
       }
@@ -170,6 +173,7 @@ class TunnelRelayState {
 
     if (pending.acceptsSse && payload.resp_json !== undefined) {
       if (!pending.sseStarted) {
+        applyResponseHeaders(pending.response, responseHeaders(payload.resp_headers));
         pending.response.status(status >= 200 && status < 300 ? 200 : status);
         startSse(pending.response);
         pending.sseStarted = true;

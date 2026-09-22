@@ -1,44 +1,44 @@
 # SSH tunnel relay
 
-## Architecture
+## Authentication model
+
+There are two independent authentication mechanisms:
+
+1. ChatGPT/OpenAI -> DevSpace uses OAuth and the `ownerToken`.
+2. Windows tunnel-client -> DevSpace control plane uses one global `tunnelToken`.
+
+The global `tunnelToken` is shared by every tunnel-client. Different MCP targets are separated by distinct `tunnelId` values and independent relay state.
+
+## Current Lisa layout
 
 ```text
-ChatGPT / OpenAI
-  |
-  | HTTPS :8550
-  | DevSpace OAuth
-  v
-Caddy
-  |
-  v
-127.0.0.1:18550
-  |
-  | /mcp + OAuth endpoints only
-  v
-DevSpace relay
-  ^
-  | shared in-memory request queue
-  |
-127.0.0.1:18551
-  ^
-  | /v1/tunnels/... only
-  | tunnel bearer token
-  |
-Caddy
-  ^
-  | HTTPS :8551
-  |
-Windows tunnel-client.exe
-  |
-  v
-local ssh-mcp -> SSH target
+ChatGPT Lisa connector
+  -> https://www.astmars.com:8550/mcp
+  -> 127.0.0.1:18550
+  -> Lisa relay queue
+
+Windows devspace-lisa
+  -> https://www.astmars.com:8551
+  -> 127.0.0.1:18551
+  -> Lisa relay queue
+
+
+ChatGPT 10236 connector
+  -> https://www.astmars.com:8552/mcp
+  -> 127.0.0.1:18552
+  -> 10236 relay queue
+
+Windows devspace-10236
+  -> https://www.astmars.com:8553
+  -> 127.0.0.1:18553
+  -> 10236 relay queue
 ```
 
-The OpenAI and Windows surfaces are separate application listeners. OAuth endpoints are not mounted on the Windows listener, and tunnel-control endpoints are not mounted on the OpenAI listener.
+Both Windows clients use the same `tunnelToken`. The two queues cannot consume each other's requests.
 
-## Configuration
+## config.jsonc
 
-`~/.devspace/config.jsonc` contains only non-secret settings:
+The legacy top-level `openai` and `tunnel` sections remain as defaults/backward compatibility. Multi-tunnel instances are declared in `tunnels`:
 
 ```jsonc
 {
@@ -49,6 +49,7 @@ The OpenAI and Windows surfaces are separate application listeners. OAuth endpoi
     "allowedHosts": ["www.astmars.com"],
     "trustProxy": true
   },
+
   "tunnel": {
     "host": "127.0.0.1",
     "port": 18551,
@@ -61,9 +62,32 @@ The OpenAI and Windows surfaces are separate application listeners. OAuth endpoi
     "responseTimeoutMs": 120000,
     "maxPollWaitMs": 30000
   },
+
+  "tunnels": {
+    "lisa": {
+      "tunnelId": "tunnel_0123456789abcdef0123456789abcdef",
+      "name": "Lisa SSH relay",
+      "description": "Windows SSH MCP relay for Lisa",
+      "openaiPort": 18550,
+      "openaiPublicBaseUrl": "https://www.astmars.com:8550",
+      "controlPort": 18551,
+      "controlPublicBaseUrl": "https://www.astmars.com:8551"
+    },
+    "10236": {
+      "tunnelId": "tunnel_fedcba9876543210fedcba9876543210",
+      "name": "10236 SSH relay",
+      "description": "Windows SSH MCP relay for 10236",
+      "openaiPort": 18552,
+      "openaiPublicBaseUrl": "https://www.astmars.com:8552",
+      "controlPort": 18553,
+      "controlPublicBaseUrl": "https://www.astmars.com:8553"
+    }
+  },
+
   "storage": {
     "stateDir": "/var/lib/devspace-relay"
   },
+
   "oauth": {
     "accessTokenTtlSeconds": 3600,
     "refreshTokenTtlSeconds": 2592000,
@@ -74,40 +98,52 @@ The OpenAI and Windows surfaces are separate application listeners. OAuth endpoi
 }
 ```
 
-`~/.devspace/auth.json` contains secrets and must be mode `0600`:
+## auth.json
 
 ```json
 {
   "ownerToken": "<owner-password>",
-  "tunnelToken": "<long-random-tunnel-secret>"
+  "tunnelToken": "<one-global-windows-tunnel-token>"
 }
 ```
 
-## Windows tunnel-client
+The same `tunnelToken` is used by every Windows profile.
 
-Use the Windows-side control plane URL:
+## Windows examples
+
+Lisa:
 
 ```text
-CONTROL_PLANE_BASE_URL=https://www.astmars.com:8551
-CONTROL_PLANE_TUNNEL_ID=<tunnelId from config.jsonc>
-CONTROL_PLANE_API_KEY=<tunnelToken from auth.json>
+DEVSPACE_CONTROL_PLANE=https://www.astmars.com:8551
+TUNNEL_ID=<Lisa tunnelId>
+DEVSPACE_TUNNEL_TOKEN=<global tunnelToken>
 ```
 
-Then point tunnel-client at the local ssh-mcp endpoint as before.
+10236:
 
-## ChatGPT / OpenAI
+```text
+DEVSPACE_CONTROL_PLANE=https://www.astmars.com:8553
+TUNNEL_ID=<10236 tunnelId>
+DEVSPACE_TUNNEL_TOKEN=<same global tunnelToken>
+```
 
-Use this MCP server URL:
+## ChatGPT connectors
+
+Lisa:
 
 ```text
 https://www.astmars.com:8550/mcp
 ```
 
-ChatGPT performs OAuth against the same `:8550` origin. The Owner password is `ownerToken` from `auth.json`.
+10236:
+
+```text
+https://www.astmars.com:8552/mcp
+```
+
+Both use the same Owner password from `ownerToken`, but OAuth tokens are bound to the corresponding MCP resource URL.
 
 ## Caddy
-
-The Lisa deployment uses two TLS listeners:
 
 ```caddy
 https://www.astmars.com:8550 {
@@ -118,6 +154,16 @@ https://www.astmars.com:8550 {
 https://www.astmars.com:8551 {
     tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
     reverse_proxy 127.0.0.1:18551
+}
+
+https://www.astmars.com:8552 {
+    tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
+    reverse_proxy 127.0.0.1:18552
+}
+
+https://www.astmars.com:8553 {
+    tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
+    reverse_proxy 127.0.0.1:18553
 }
 ```
 

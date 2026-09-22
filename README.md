@@ -1,28 +1,28 @@
 # DevSpace Relay
 
-A low-resource MCP relay for one machine:
+A low-resource MCP relay that connects ChatGPT/OpenAI to Windows-hosted `tunnel-client.exe` instances.
 
-- ChatGPT/OpenAI connects to an OAuth-protected MCP endpoint.
-- Windows `tunnel-client.exe` connects to a separate tunnel control-plane endpoint.
-- Both surfaces share an in-memory request queue, but they use different listeners and authentication mechanisms.
+- One global `tunnelToken` authenticates all Windows tunnel clients.
+- Each MCP target has its own `tunnelId`, request queue, OpenAI listener, and control-plane listener.
+- ChatGPT/OpenAI uses OAuth on the OpenAI listener.
+- Windows tunnel-client uses the shared tunnel bearer token on the control-plane listener.
 
-This branch is intentionally relay-only. The original DevSpace UI, workspace tools, subagents, worktrees, skills, artifact exchange, and local agent daemon have been removed.
+This branch is relay-only. The original DevSpace UI, workspace tools, subagents, worktrees, skills, artifact exchange, and local agent daemon have been removed.
 
 ## Lisa deployment
 
-Public endpoints:
+Current public endpoints:
 
-- OpenAI OAuth + MCP: `https://www.astmars.com:8550/mcp`
-- Windows tunnel control plane: `https://www.astmars.com:8551/v1/tunnels/<tunnel_id>`
+| Target | OpenAI MCP | Windows control plane |
+| --- | --- | --- |
+| Lisa | `https://www.astmars.com:8550/mcp` | `https://www.astmars.com:8551` |
+| 10236 | `https://www.astmars.com:8552/mcp` | `https://www.astmars.com:8553` |
 
-Local listeners:
-
-- `127.0.0.1:18550` — OpenAI OAuth/MCP only
-- `127.0.0.1:18551` — Windows tunnel control plane only
+All tunnel clients use the same `tunnelToken` from `~/.devspace/auth.json`, while each profile uses a different `TUNNEL_ID`.
 
 Configuration is stored in `~/.devspace/config.jsonc`. Secrets are stored separately in `~/.devspace/auth.json`.
 
-See [docs/ssh-tunnel-relay.md](docs/ssh-tunnel-relay.md) for the exact configuration and deployment layout.
+See [docs/ssh-tunnel-relay.md](docs/ssh-tunnel-relay.md) for details.
 
 ## Development
 

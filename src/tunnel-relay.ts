@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import {
+  createOAuthMetadata,
   getOAuthProtectedResourceMetadataUrl,
   mcpAuthRouter,
 } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -26,6 +27,17 @@ const REQUEST_HEADER_ALLOWLIST = [
   "mcp-protocol-version",
   "last-event-id",
 ] as const;
+
+export interface TunnelDefinition {
+  slug: string;
+  tunnelId: string;
+}
+
+export interface RelayApplications {
+  openaiApp: ReturnType<typeof createMcpExpressApp>;
+  tunnelApp: Express;
+  close(): Promise<void>;
+}
 
 interface JsonRpcCommand {
   request_id: string;
@@ -72,12 +84,6 @@ interface PollWaiter {
   timer: NodeJS.Timeout;
 }
 
-export interface RelayApplications {
-  openaiApp: ReturnType<typeof createMcpExpressApp>;
-  tunnelApp: Express;
-  close(): Promise<void>;
-}
-
 class TunnelRelayState {
   private readonly commands: TunnelCommand[] = [];
   private readonly pending = new Map<string, PendingRequest>();
@@ -85,7 +91,7 @@ class TunnelRelayState {
   private closed = false;
   private lastPollAt?: string;
 
-  constructor(private readonly config: ServerConfig) {}
+  constructor(private readonly responseTimeoutMs: number) {}
 
   snapshot(): { queued: number; pending: number; lastPollAt?: string } {
     return {
@@ -184,6 +190,7 @@ class TunnelRelayState {
     if (this.closed) return;
     this.closed = true;
     this.wakePollers();
+
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       if (!pending.response.headersSent) {
@@ -196,6 +203,7 @@ class TunnelRelayState {
         pending.response.end();
       }
     }
+
     this.pending.clear();
     this.commands.length = 0;
   }
@@ -218,9 +226,10 @@ class TunnelRelayState {
       shard_token: shardToken,
       channel: "main" as const,
       created_at: new Date().toISOString(),
-      response_timeout: `${Math.ceil(this.config.relay.responseTimeoutMs / 1000)}s`,
+      response_timeout: `${Math.ceil(this.responseTimeoutMs / 1000)}s`,
       headers: requestHeaders(req),
     };
+
     const command: TunnelCommand = commandType === "jsonrpc"
       ? { ...base, command_type: "jsonrpc", jsonrpc }
       : { ...base, command_type: "session_termination" };
@@ -229,6 +238,7 @@ class TunnelRelayState {
       const current = this.pending.get(requestId);
       if (!current) return;
       this.pending.delete(requestId);
+
       if (!current.response.headersSent) {
         current.response.status(504).json({
           jsonrpc: "2.0",
@@ -238,7 +248,7 @@ class TunnelRelayState {
       } else {
         current.response.end();
       }
-    }, this.config.relay.responseTimeoutMs);
+    }, this.responseTimeoutMs);
     timer.unref?.();
 
     this.pending.set(requestId, {
@@ -270,16 +280,38 @@ class TunnelRelayState {
   }
 }
 
-export function createRelayApplications(config: ServerConfig): RelayApplications {
-  const state = new TunnelRelayState(config);
-  const mcpUrl = new URL("/mcp", config.openai.publicBaseUrl);
-  const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
-  const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
-  const bearerAuth = requireBearerAuth({
-    verifier: oauthProvider,
-    requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
-    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
-  });
+export function createRelayApplications(
+  config: ServerConfig,
+  tunnels: TunnelDefinition[],
+): RelayApplications {
+  if (tunnels.length === 0) throw new Error("At least one tunnel is required");
+
+  const tunnelBySlug = new Map(tunnels.map((entry) => [entry.slug, entry]));
+  const tunnelById = new Map(tunnels.map((entry) => [entry.tunnelId, entry]));
+  if (tunnelBySlug.size !== tunnels.length || tunnelById.size !== tunnels.length) {
+    throw new Error("Tunnel slugs and tunnel IDs must be unique");
+  }
+
+  const stateBySlug = new Map(
+    tunnels.map((entry) => [
+      entry.slug,
+      new TunnelRelayState(config.relay.responseTimeoutMs),
+    ]),
+  );
+
+  const firstMcpUrl = mcpUrl(config.openai.publicBaseUrl, tunnels[0]!.slug);
+  const allMcpUrls = tunnels.map((entry) => mcpUrl(config.openai.publicBaseUrl, entry.slug));
+  const oauthProvider = new SingleUserOAuthProvider(
+    {
+      ...config.oauth,
+      allowedResourceUrls: Array.from(new Set([
+        ...config.oauth.allowedResourceUrls,
+        ...allMcpUrls.map((url) => url.href),
+      ])),
+    },
+    firstMcpUrl,
+    config.stateDir,
+  );
 
   const openaiApp = createMcpExpressApp({
     host: config.openai.host,
@@ -287,59 +319,59 @@ export function createRelayApplications(config: ServerConfig): RelayApplications
   });
   if (config.openai.trustProxy) openaiApp.set("trust proxy", true);
 
+  const oauthMetadata = createOAuthMetadata({
+    provider: oauthProvider,
+    issuerUrl: new URL(config.openai.publicBaseUrl),
+    baseUrl: new URL(config.openai.publicBaseUrl),
+    scopesSupported: config.oauth.scopes,
+  });
+
   openaiApp.use(mcpAuthRouter({
     provider: oauthProvider,
     issuerUrl: new URL(config.openai.publicBaseUrl),
     baseUrl: new URL(config.openai.publicBaseUrl),
-    resourceServerUrl,
+    resourceServerUrl: firstMcpUrl,
     scopesSupported: config.oauth.scopes,
-    resourceName: config.relay.name,
+    resourceName: tunnels[0]!.slug,
   }));
 
+  for (const tunnel of tunnels) {
+    const url = mcpUrl(config.openai.publicBaseUrl, tunnel.slug);
+    const metadataPath = new URL(getOAuthProtectedResourceMetadataUrl(url)).pathname;
+
+    openaiApp.get(metadataPath, (_req, res) => {
+      res.json({
+        resource: url.href,
+        authorization_servers: [oauthMetadata.issuer],
+        scopes_supported: config.oauth.scopes,
+        resource_name: tunnel.slug,
+      });
+    });
+  }
+
   openaiApp.get("/healthz", (_req, res) => {
-    res.json({ ok: true, surface: "openai", pending: state.snapshot().pending });
+    res.json({
+      ok: true,
+      surface: "openai",
+      tunnels: Object.fromEntries(
+        tunnels.map((entry) => [
+          entry.slug,
+          stateBySlug.get(entry.slug)!.snapshot(),
+        ]),
+      ),
+    });
   });
 
-  openaiApp.post("/mcp", async (req, res) => {
-    await runBearerAuth(bearerAuth, req, res);
-    if (res.headersSent) return;
-    if (!req.auth?.resource || !oauthProvider.isResourceAllowed(req.auth.resource)) {
-      res.status(401).json({
-        jsonrpc: "2.0",
-        id: null,
-        error: { code: -32001, message: "Unauthorized" },
-      });
-      return;
-    }
-    if (!req.body || typeof req.body !== "object") {
-      res.status(400).json({
-        jsonrpc: "2.0",
-        id: null,
-        error: { code: -32600, message: "Invalid Request" },
-      });
-      return;
-    }
-    state.enqueueJsonRpc(req, res);
-  });
-
-  openaiApp.delete("/mcp", async (req, res) => {
-    await runBearerAuth(bearerAuth, req, res);
-    if (res.headersSent) return;
-    if (!req.header("mcp-session-id")) {
-      res.status(400).json({
-        jsonrpc: "2.0",
-        id: null,
-        error: { code: -32600, message: "Mcp-Session-Id is required" },
-      });
-      return;
-    }
-    state.enqueueSessionTermination(req, res);
-  });
-
-  openaiApp.get("/mcp", (_req, res) => {
-    res.setHeader("Allow", "POST, DELETE");
-    res.status(405).end();
-  });
+  for (const tunnel of tunnels) {
+    registerMcpRoutes(
+      openaiApp,
+      `/mcp/${tunnel.slug}`,
+      tunnel,
+      stateBySlug.get(tunnel.slug)!,
+      oauthProvider,
+      config,
+    );
+  }
 
   const tunnelApp = express();
   tunnelApp.disable("x-powered-by");
@@ -350,51 +382,78 @@ export function createRelayApplications(config: ServerConfig): RelayApplications
     res.json({
       ok: true,
       surface: "tunnel",
-      tunnel_id: config.relay.tunnelId,
-      ...state.snapshot(),
+      tunnels: Object.fromEntries(
+        tunnels.map((entry) => [
+          entry.slug,
+          {
+            tunnel_id: entry.tunnelId,
+            ...stateBySlug.get(entry.slug)!.snapshot(),
+          },
+        ]),
+      ),
     });
   });
 
   tunnelApp.get("/v1/tunnels/:tunnelId", (req, res) => {
-    if (!authorizeTunnel(req, res, config)) return;
+    const tunnel = authorizeTunnel(req, res, config, tunnelById);
+    if (!tunnel) return;
+
     res.json({
-      id: config.relay.tunnelId,
-      name: config.relay.name,
-      description: config.relay.description,
+      id: tunnel.tunnelId,
+      name: tunnel.slug,
+      description: tunnel.slug,
     });
   });
 
   tunnelApp.get("/v1/tunnels/:tunnelId/poll", async (req, res) => {
-    if (!authorizeTunnel(req, res, config)) return;
+    const tunnel = authorizeTunnel(req, res, config, tunnelById);
+    if (!tunnel) return;
+
+    const state = stateBySlug.get(tunnel.slug)!;
     const commands = await state.poll(
       parsePollLimit(req.query.limit),
       parsePollWait(req.query.timeout_ms, config.relay.maxPollWaitMs),
     );
+
     if (commands.length === 0) {
       res.status(204).end();
       return;
     }
+
     res.json({ commands });
   });
 
   tunnelApp.post("/v1/tunnels/:tunnelId/response", (req, res) => {
-    if (!authorizeTunnel(req, res, config)) return;
+    const tunnel = authorizeTunnel(req, res, config, tunnelById);
+    if (!tunnel) return;
+
+    const state = stateBySlug.get(tunnel.slug)!;
     const result = state.acceptResponse(
       req.header("x-tunnel-shard-token"),
       (req.body ?? {}) as TunnelResponsePayload,
     );
+
     if (result === "not_found") {
-      res.status(404).json({ error: { code: "request_not_found", message: "Request is no longer pending" } });
+      res.status(404).json({
+        error: { code: "request_not_found", message: "Request is no longer pending" },
+      });
       return;
     }
+
     if (result === "invalid_shard") {
-      res.status(403).json({ error: { code: "invalid_shard_token", message: "Invalid shard token" } });
+      res.status(403).json({
+        error: { code: "invalid_shard_token", message: "Invalid shard token" },
+      });
       return;
     }
+
     if (result === "invalid_payload") {
-      res.status(400).json({ error: { code: "invalid_response_payload", message: "Invalid tunnel response" } });
+      res.status(400).json({
+        error: { code: "invalid_response_payload", message: "Invalid tunnel response" },
+      });
       return;
     }
+
     res.json({ status: "ok" });
   });
 
@@ -402,23 +461,110 @@ export function createRelayApplications(config: ServerConfig): RelayApplications
     openaiApp,
     tunnelApp,
     close: async () => {
-      state.close();
+      for (const state of stateBySlug.values()) state.close();
       oauthProvider.close();
     },
   };
 }
 
-function authorizeTunnel(req: Request, res: Response, config: ServerConfig): boolean {
-  if (req.params.tunnelId !== config.relay.tunnelId) {
-    res.status(404).json({ error: { code: "tunnel_not_found", message: "Tunnel not found" } });
-    return false;
+function registerMcpRoutes(
+  app: ReturnType<typeof createMcpExpressApp>,
+  path: string,
+  _tunnel: TunnelDefinition,
+  state: TunnelRelayState,
+  oauthProvider: SingleUserOAuthProvider,
+  config: ServerConfig,
+): void {
+  const url = new URL(path, config.openai.publicBaseUrl);
+  const resourceServerUrl = resourceUrlFromServerUrl(url);
+  const bearerAuth = requireBearerAuth({
+    verifier: oauthProvider,
+    requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
+  });
+
+  app.post(path, async (req, res) => {
+    await runBearerAuth(bearerAuth, req, res);
+    if (res.headersSent) return;
+
+    if (!req.auth?.resource || !sameResource(req.auth.resource, resourceServerUrl)) {
+      res.status(401).json({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32001, message: "Unauthorized" },
+      });
+      return;
+    }
+
+    if (!req.body || typeof req.body !== "object") {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request" },
+      });
+      return;
+    }
+
+    state.enqueueJsonRpc(req, res);
+  });
+
+  app.delete(path, async (req, res) => {
+    await runBearerAuth(bearerAuth, req, res);
+    if (res.headersSent) return;
+
+    if (!req.auth?.resource || !sameResource(req.auth.resource, resourceServerUrl)) {
+      res.status(401).json({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32001, message: "Unauthorized" },
+      });
+      return;
+    }
+
+    if (!req.header("mcp-session-id")) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Mcp-Session-Id is required" },
+      });
+      return;
+    }
+
+    state.enqueueSessionTermination(req, res);
+  });
+
+  app.get(path, (_req, res) => {
+    res.setHeader("Allow", "POST, DELETE");
+    res.status(405).end();
+  });
+}
+
+function authorizeTunnel(
+  req: Request,
+  res: Response,
+  config: ServerConfig,
+  tunnelById: Map<string, TunnelDefinition>,
+): TunnelDefinition | undefined {
+  const tunnelId = Array.isArray(req.params.tunnelId)
+    ? req.params.tunnelId[0]
+    : req.params.tunnelId;
+  const tunnel = tunnelId ? tunnelById.get(tunnelId) : undefined;
+  if (!tunnel) {
+    res.status(404).json({
+      error: { code: "tunnel_not_found", message: "Tunnel not found" },
+    });
+    return undefined;
   }
+
   const token = bearerToken(req);
   if (!token || !safeEquals(token, config.relay.tunnelToken)) {
-    res.status(401).json({ error: { code: "invalid_api_key", message: "Invalid tunnel API key" } });
-    return false;
+    res.status(401).json({
+      error: { code: "invalid_api_key", message: "Invalid tunnel API key" },
+    });
+    return undefined;
   }
-  return true;
+
+  return tunnel;
 }
 
 async function runBearerAuth(
@@ -429,6 +575,14 @@ async function runBearerAuth(
   await new Promise<void>((resolve, reject) => {
     middleware(req, res, (error?: unknown) => error ? reject(error) : resolve());
   });
+}
+
+function mcpUrl(baseUrl: string, slug: string): URL {
+  return new URL(`/mcp/${slug}`, baseUrl);
+}
+
+function sameResource(left: URL, right: URL): boolean {
+  return resourceUrlFromServerUrl(left).href === resourceUrlFromServerUrl(right).href;
 }
 
 function bearerToken(req: Request): string | undefined {
@@ -479,13 +633,18 @@ function normalizeStatus(value: unknown): number {
 function responseHeaders(value: unknown): Record<string, string[]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const result: Record<string, string[]> = {};
+
   for (const [name, rawValues] of Object.entries(value)) {
-    if (!RESPONSE_HEADER_ALLOWLIST.has(name.toLowerCase()) || !Array.isArray(rawValues)) continue;
+    if (!RESPONSE_HEADER_ALLOWLIST.has(name.toLowerCase()) || !Array.isArray(rawValues)) {
+      continue;
+    }
+
     const values = rawValues.filter(
       (entry): entry is string => typeof entry === "string" && entry.length > 0,
     );
     if (values.length > 0) result[name] = values;
   }
+
   return result;
 }
 

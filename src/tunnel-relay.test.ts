@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "node:http";
 import type { ServerConfig } from "./config.js";
-import { createRelayApplications } from "./tunnel-relay.js";
+import {
+  createRelayApplications,
+  type TunnelDefinition,
+} from "./tunnel-relay.js";
 
 const stateDir = mkdtempSync(join(tmpdir(), "devspace-relay-state-"));
 const config: ServerConfig = {
@@ -33,36 +36,62 @@ const config: ServerConfig = {
     allowedRedirectHosts: ["localhost", "127.0.0.1", "chatgpt.com"],
   },
   relay: {
-    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
     tunnelToken: "tunnel-secret-value-123456",
-    name: "Lisa",
-    description: "test",
     responseTimeoutMs: 10000,
     maxPollWaitMs: 1000,
   },
 };
 
-const apps = createRelayApplications(config);
+const tunnels: TunnelDefinition[] = [
+  {
+    slug: "lisa",
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+  },
+  {
+    slug: "10236",
+    tunnelId: "tunnel_fedcba9876543210fedcba9876543210",
+  },
+];
+
+const apps = createRelayApplications(config, tunnels);
 const openai = await listen(apps.openaiApp);
 const tunnel = await listen(apps.tunnelApp);
+
 try {
   const openaiBase = base(openai);
   const tunnelBase = base(tunnel);
 
   assert.equal((await fetch(`${openaiBase}/healthz`)).status, 200);
-  assert.equal((await fetch(`${openaiBase}/v1/tunnels/${config.relay.tunnelId}`)).status, 404);
+  assert.equal((await fetch(`${openaiBase}/mcp`)).status, 404);
+  assert.equal((await fetch(`${openaiBase}/mcp/lisa`)).status, 405);
+  assert.equal((await fetch(`${openaiBase}/mcp/10236`)).status, 405);
 
   assert.equal((await fetch(`${tunnelBase}/healthz`)).status, 200);
   assert.equal((await fetch(`${tunnelBase}/mcp`, { method: "POST" })).status, 404);
-  assert.equal(
-    (await fetch(`${tunnelBase}/v1/tunnels/${config.relay.tunnelId}`)).status,
-    401,
+
+  for (const entry of tunnels) {
+    assert.equal(
+      (await fetch(`${tunnelBase}/v1/tunnels/${entry.tunnelId}`)).status,
+      401,
+    );
+
+    const control = await fetch(
+      `${tunnelBase}/v1/tunnels/${entry.tunnelId}`,
+      {
+        headers: { authorization: `Bearer ${config.relay.tunnelToken}` },
+      },
+    );
+    assert.equal(control.status, 200);
+    assert.equal((await control.json() as { id: string }).id, entry.tunnelId);
+  }
+
+  const wrong = await fetch(
+    `${tunnelBase}/v1/tunnels/tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+    {
+      headers: { authorization: `Bearer ${config.relay.tunnelToken}` },
+    },
   );
-  const control = await fetch(`${tunnelBase}/v1/tunnels/${config.relay.tunnelId}`, {
-    headers: { authorization: `Bearer ${config.relay.tunnelToken}` },
-  });
-  assert.equal(control.status, 200);
-  assert.equal((await control.json() as { id: string }).id, config.relay.tunnelId);
+  assert.equal(wrong.status, 404);
 } finally {
   await Promise.all([close(openai), close(tunnel)]);
   await apps.close();

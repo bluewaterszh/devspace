@@ -1,23 +1,11 @@
-# Lisa MCP
+# OpenAI / ChatGPT OAuth + MCP for all tunnels
 https://www.astmars.com:8550 {
         tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
         reverse_proxy 127.0.0.1:18550
 }
 
-# Lisa Windows tunnel control plane
+# Windows tunnel-client control plane for all tunnels
 https://www.astmars.com:8551 {
         tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
         reverse_proxy 127.0.0.1:18551
-}
-
-# 10236 MCP
-https://www.astmars.com:8552 {
-        tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
-        reverse_proxy 127.0.0.1:18552
-}
-
-# 10236 Windows tunnel control plane
-https://www.astmars.com:8553 {
-        tls /etc/caddy/certs/astmars.com_bundle.crt /etc/caddy/certs/astmars.com.key
-        reverse_proxy 127.0.0.1:18553
 }

@@ -13,10 +13,7 @@ export interface ListenerConfig {
 }
 
 export interface RelayConfig {
-  tunnelId: string;
   tunnelToken: string;
-  name: string;
-  description: string;
   responseTimeoutMs: number;
   maxPollWaitMs: number;
 }
@@ -33,9 +30,6 @@ export interface ServerConfig {
 interface StoredConfig {
   openai?: Partial<ListenerConfig>;
   tunnel?: Partial<ListenerConfig> & {
-    tunnelId?: string;
-    name?: string;
-    description?: string;
     responseTimeoutMs?: number;
     maxPollWaitMs?: number;
   };
@@ -62,13 +56,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const auth = readJson<AuthConfig>(authPath);
   assertPrivateFile(authPath);
 
-  const ownerToken = requiredSecret(auth.ownerToken, "ownerToken");
-  const tunnelToken = requiredSecret(auth.tunnelToken, "tunnelToken");
-  const tunnelId = stored.tunnel?.tunnelId?.trim();
-  if (!tunnelId || !/^tunnel_[0-9a-f]{32}$/.test(tunnelId)) {
-    throw new Error("tunnel.tunnelId must match tunnel_ followed by 32 lowercase hex characters");
-  }
-
   return {
     configDir,
     openai: listener(stored.openai, {
@@ -83,8 +70,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     }),
     stateDir: resolve(stored.storage?.stateDir ?? join(configDir, "state")),
     oauth: {
-      ownerToken,
-      accessTokenTtlSeconds: positiveInt(stored.oauth?.accessTokenTtlSeconds, 3600, "oauth.accessTokenTtlSeconds"),
+      ownerToken: requiredSecret(auth.ownerToken, "ownerToken"),
+      accessTokenTtlSeconds: positiveInt(
+        stored.oauth?.accessTokenTtlSeconds,
+        3600,
+        "oauth.accessTokenTtlSeconds",
+      ),
       refreshTokenTtlSeconds: positiveInt(
         stored.oauth?.refreshTokenTtlSeconds,
         30 * 24 * 3600,
@@ -98,10 +89,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       ),
     },
     relay: {
-      tunnelId,
-      tunnelToken,
-      name: stored.tunnel?.name?.trim() || tunnelId,
-      description: stored.tunnel?.description?.trim() || "DevSpace SSH MCP relay",
+      tunnelToken: requiredSecret(auth.tunnelToken, "tunnelToken"),
       responseTimeoutMs: positiveInt(
         stored.tunnel?.responseTimeoutMs,
         120_000,
@@ -124,6 +112,7 @@ function listener(
   const port = positiveInt(value?.port, defaults.port, "listener.port");
   const publicBaseUrl = normalizeUrl(value?.publicBaseUrl ?? defaults.publicBaseUrl);
   const publicHost = new URL(publicBaseUrl).hostname;
+
   return {
     host,
     port,
@@ -150,7 +139,9 @@ function normalizeUrl(value: string): string {
 
 function positiveInt(value: number | undefined, fallback: number, name: string): number {
   const result = value ?? fallback;
-  if (!Number.isInteger(result) || result <= 0) throw new Error(`${name} must be a positive integer`);
+  if (!Number.isInteger(result) || result <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
   return result;
 }
 
@@ -161,7 +152,9 @@ function stringArray(value: string[] | undefined, fallback: string[]): string[] 
 
 function requiredSecret(value: string | undefined, name: string): string {
   const secret = value?.trim();
-  if (!secret || secret.length < 16) throw new Error(`${name} must be at least 16 characters`);
+  if (!secret || secret.length < 16) {
+    throw new Error(`${name} must be at least 16 characters`);
+  }
   return secret;
 }
 
@@ -170,7 +163,9 @@ function readJsonc<T>(path: string): T {
   const value = parse(readFileSync(path, "utf8"), errors, { allowTrailingComma: true });
   if (errors.length > 0) {
     const first = errors[0]!;
-    throw new Error(`Unable to parse ${path}: ${printParseErrorCode(first.error)} at offset ${first.offset}`);
+    throw new Error(
+      `Unable to parse ${path}: ${printParseErrorCode(first.error)} at offset ${first.offset}`,
+    );
   }
   return (value ?? {}) as T;
 }

@@ -10,6 +10,7 @@ import type { Request, Response } from "express";
 import type { ServerConfig } from "./config.js";
 import { logEvent, requestIp, requestPath } from "./logger.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { loadDevspaceFiles } from "./user-config.js";
 
 const DEFAULT_RESPONSE_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_POLL_WAIT_MS = 30_000;
@@ -110,38 +111,40 @@ function parsePositiveInteger(
 export function loadTunnelRelayOptions(
   env: NodeJS.ProcessEnv = process.env,
 ): TunnelRelayOptions {
-  const tunnelId = env.DEVSPACE_RELAY_TUNNEL_ID?.trim();
+  const files = loadDevspaceFiles(env);
+  const stored = files.config.relay;
+  const tunnelId = env.DEVSPACE_RELAY_TUNNEL_ID?.trim() || stored.tunnelId?.trim();
   if (!tunnelId) {
-    throw new Error("DEVSPACE_RELAY_TUNNEL_ID is required");
+    throw new Error("Relay tunnel id is required at relay.tunnelId in ~/.devspace/config.jsonc");
   }
   if (!/^tunnel_[0-9a-f]{32}$/.test(tunnelId)) {
     throw new Error(
-      "DEVSPACE_RELAY_TUNNEL_ID must match tunnel_ followed by 32 lowercase hex characters",
+      "relay.tunnelId must match tunnel_ followed by 32 lowercase hex characters",
     );
   }
 
-  const tunnelToken = env.DEVSPACE_RELAY_TUNNEL_TOKEN?.trim();
+  const tunnelToken = env.DEVSPACE_RELAY_TUNNEL_TOKEN?.trim() || files.auth.tunnelToken?.trim();
   if (!tunnelToken || tunnelToken.length < 16) {
     throw new Error(
-      "DEVSPACE_RELAY_TUNNEL_TOKEN is required and must be at least 16 characters",
+      "Relay tunnel token is required at tunnelToken in ~/.devspace/auth.json and must be at least 16 characters",
     );
   }
 
   return {
     tunnelId,
     tunnelToken,
-    name: env.DEVSPACE_RELAY_TUNNEL_NAME?.trim() || tunnelId,
+    name: env.DEVSPACE_RELAY_TUNNEL_NAME?.trim() || stored.name?.trim() || tunnelId,
     description:
       env.DEVSPACE_RELAY_TUNNEL_DESCRIPTION?.trim()
-      || "DevSpace SSH MCP relay",
+      || stored.description,
     responseTimeoutMs: parsePositiveInteger(
       env.DEVSPACE_RELAY_RESPONSE_TIMEOUT_MS,
-      DEFAULT_RESPONSE_TIMEOUT_MS,
+      stored.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
       "DEVSPACE_RELAY_RESPONSE_TIMEOUT_MS",
     ),
     maxPollWaitMs: parsePositiveInteger(
       env.DEVSPACE_RELAY_MAX_POLL_WAIT_MS,
-      DEFAULT_MAX_POLL_WAIT_MS,
+      stored.maxPollWaitMs ?? DEFAULT_MAX_POLL_WAIT_MS,
       "DEVSPACE_RELAY_MAX_POLL_WAIT_MS",
     ),
   };

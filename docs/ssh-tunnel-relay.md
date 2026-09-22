@@ -48,23 +48,42 @@ devspace init
 devspace config set publicBaseUrl https://mcp-238.example.com
 ```
 
-Then set one relay tunnel:
+Persist the relay metadata in `~/.devspace/config.jsonc`. The tunnel id,
+display name, description, and timeout tuning are not secrets:
+
+```jsonc
+{
+  // ...normal DevSpace settings...
+  "relay": {
+    "tunnelId": "tunnel_0123456789abcdef0123456789abcdef",
+    "name": "SSH-238",
+    "description": "SSH MCP relay for 238",
+    "responseTimeoutMs": 120000,
+    "maxPollWaitMs": 30000
+  }
+}
+```
+
+Persist the shared tunnel secret separately in `~/.devspace/auth.json`:
+
+```json
+{
+  "ownerToken": "<existing-devspace-owner-password>",
+  "tunnelToken": "<long-random-secret>"
+}
+```
+
+`devspace init --force` preserves an existing `tunnelToken` and generates
+one when it is absent. The file is written with mode `0600`.
+
+Then start the relay:
 
 ```bash
-export DEVSPACE_RELAY_TUNNEL_ID=tunnel_0123456789abcdef0123456789abcdef
-export DEVSPACE_RELAY_TUNNEL_TOKEN='<long-random-secret>'
-export DEVSPACE_RELAY_TUNNEL_NAME='SSH-238'
-export DEVSPACE_RELAY_TUNNEL_DESCRIPTION='SSH MCP relay for 238'
-
 devspace relay
 ```
 
-Optional tuning:
-
-```bash
-export DEVSPACE_RELAY_RESPONSE_TIMEOUT_MS=120000
-export DEVSPACE_RELAY_MAX_POLL_WAIT_MS=30000
-```
+The old `DEVSPACE_RELAY_*` variables remain optional process-level overrides,
+but they are no longer required for normal startup.
 
 The public MCP URL is:
 
@@ -85,7 +104,7 @@ it at the DevSpace relay instead of `api.openai.com`:
 
 ```bash
 export CONTROL_PLANE_BASE_URL=https://mcp-238.example.com
-export CONTROL_PLANE_TUNNEL_ID=tunnel_0123456789abcdef0123456789abcdef
+export CONTROL_PLANE_TUNNEL_ID='tunnel_0123456789abcdef0123456789abcdef'
 export CONTROL_PLANE_API_KEY='<same-relay-tunnel-token>'
 
 tunnel-client.exe run \
@@ -122,7 +141,7 @@ POST /v1/tunnels/<tunnel_id>/response
 The control-plane routes require:
 
 ```http
-Authorization: Bearer <DEVSPACE_RELAY_TUNNEL_TOKEN>
+Authorization: Bearer <tunnelToken from ~/.devspace/auth.json>
 ```
 
 The relay implements the public OpenAI tunnel-client wire contract needed for

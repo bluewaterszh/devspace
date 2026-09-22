@@ -83,8 +83,7 @@ async function main(argv: string[]): Promise<void> {
       await serve();
       return;
     case "relay":
-      await ensureConfigured();
-      await serveRelay();
+      await import("./relay-cli.js");
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -260,7 +259,9 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     );
 
     const auth = {
+      ...files.auth,
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
+      tunnelToken: files.auth.tunnelToken ?? generateOwnerToken(),
     };
 
     setDevspaceConfigValues([
@@ -312,53 +313,6 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     }
     throw error;
   }
-}
-
-async function serveRelay(): Promise<void> {
-  const sqliteStatus = checkSqliteNative();
-  if (sqliteStatus !== "ok") {
-    throw new Error(
-      [
-        "better-sqlite3 could not load for this Node runtime.",
-        sqliteStatus,
-        "",
-        "Try reinstalling or rebuilding dependencies under the active Node version:",
-        "  npm rebuild better-sqlite3",
-      ].join("\n"),
-    );
-  }
-
-  const config = loadConfig();
-  const {
-    createTunnelRelayServer,
-    loadTunnelRelayOptions,
-  } = await import("./tunnel-relay.js");
-  const options = loadTunnelRelayOptions();
-  const { app, close } = createTunnelRelayServer(config, options);
-  const httpServer = app.listen(config.port, config.host, () => {
-    console.log(`devspace relay listening on http://${config.host}:${config.port}/mcp`);
-    console.log(`public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
-    console.log(`control plane: ${config.publicBaseUrl}/v1/tunnels/${options.tunnelId}`);
-    console.log(`tunnel id: ${options.tunnelId}`);
-    console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
-    console.log("auth: DevSpace OAuth owner-password flow + tunnel bearer token");
-  });
-
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    await shutdownHttpServer(httpServer, close);
-    process.exit(0);
-  };
-  const handleShutdown = () => {
-    void shutdown().catch((error) => {
-      console.error("devspace relay shutdown failed", error);
-      process.exit(1);
-    });
-  };
-  process.once("SIGINT", handleShutdown);
-  process.once("SIGTERM", handleShutdown);
 }
 
 async function serve(): Promise<void> {

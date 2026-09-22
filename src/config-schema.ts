@@ -3,7 +3,7 @@ import { subagentsConfigSchema } from "./local-agent-config.js";
 
 export const DEVSPACE_CONFIG_VERSION = 1 as const;
 export const DEVSPACE_CONFIG_SCHEMA_URL =
-  "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json";
+  "https://raw.githubusercontent.com/bluewaterszh/devspace/ssh-tunnel-relay-v1/schema/v1/devspace.schema.json";
 
 const serverConfigSchema = z.object({
   host: z.string().trim().min(1).default("127.0.0.1"),
@@ -68,6 +68,14 @@ const oauthConfigSchema = z.object({
   ]),
 }).strict().prefault({});
 
+const relayConfigSchema = z.object({
+  tunnelId: z.string().trim().regex(/^tunnel_[0-9a-f]{32}$/).nullable().default(null),
+  name: z.string().trim().min(1).nullable().default(null),
+  description: z.string().trim().min(1).default("DevSpace SSH MCP relay"),
+  responseTimeoutMs: z.number().int().positive().default(120_000),
+  maxPollWaitMs: z.number().int().positive().default(30_000),
+}).strict().prefault({});
+
 export const devspaceConfigSchema = z.object({
   $schema: z.string().url().default(DEVSPACE_CONFIG_SCHEMA_URL),
   configVersion: z.literal(DEVSPACE_CONFIG_VERSION),
@@ -85,6 +93,7 @@ export const devspaceConfigSchema = z.object({
   }),
   logging: loggingConfigSchema,
   oauth: oauthConfigSchema,
+  relay: relayConfigSchema,
 }).strict();
 
 export type DevspaceConfig = z.output<typeof devspaceConfigSchema>;

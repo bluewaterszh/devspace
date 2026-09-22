@@ -29,6 +29,7 @@ import { expandHomePath } from "./roots.js";
 
 const devspaceAuthConfigSchema = z.object({
   ownerToken: z.string().optional(),
+  tunnelToken: z.string().optional(),
 }).passthrough();
 
 export type DevspaceUserConfig = DevspaceConfig;

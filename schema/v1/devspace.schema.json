@@ -1,12 +1,12 @@
 {
-  "$id": "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json",
+  "$id": "https://raw.githubusercontent.com/bluewaterszh/devspace/ssh-tunnel-relay-v1/schema/v1/devspace.schema.json",
   "title": "DevSpace configuration",
   "description": "Versioned configuration for a local DevSpace MCP server.",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
     "$schema": {
-      "default": "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json",
+      "default": "https://raw.githubusercontent.com/bluewaterszh/devspace/ssh-tunnel-relay-v1/schema/v1/devspace.schema.json",
       "type": "string",
       "format": "uri"
     },
@@ -362,6 +362,54 @@
             "type": "string",
             "minLength": 1
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "relay": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "tunnelId": {
+          "default": null,
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^tunnel_[0-9a-f]{32}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "default": null,
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "default": "DevSpace SSH MCP relay",
+          "type": "string",
+          "minLength": 1
+        },
+        "responseTimeoutMs": {
+          "default": 120000,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxPollWaitMs": {
+          "default": 30000,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
         }
       },
       "additionalProperties": false

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import { InvalidRequestError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { openSqliteDatabase, type SqliteDatabaseHandle } from "./db/sqlite.js";
 
 export interface PersistedAccessTokenRecord {
   clientId: string;
@@ -38,10 +38,10 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
 }
 
 export class SqliteOAuthStore {
-  private readonly database: DatabaseHandle;
+  private readonly database: SqliteDatabaseHandle;
 
   constructor(stateDir: string) {
-    this.database = openDatabase(stateDir);
+    this.database = openSqliteDatabase(stateDir);
     this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
   }
 

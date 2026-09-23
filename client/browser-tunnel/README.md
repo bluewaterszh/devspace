@@ -57,12 +57,22 @@ DEVSPACE_CONTROL_PLANE=https://www.astmars.com
 DEVSPACE_TUNNEL_TOKEN=<same tunnel token used by DevSpace>
 TUNNEL_ID=tunnel_<32-lowercase-hex>
 
-HTTPS_PROXY=http://<enterprise-proxy-host>:8080
 DEVSPACE_BROWSER=chrome
 ```
 
 `MCP_URL` normally does not need to be set; it is derived as
 `http://127.0.0.1:$MCP_PORT/`.
+
+If this machine must use an enterprise proxy, export it in the shell before
+running the control script, for example:
+
+```bash
+export HTTPS_PROXY=http://proxy-host:8080
+export HTTP_PROXY=http://proxy-host:8080
+```
+
+The control script does not parse or manage proxy settings; the child browser
+client simply inherits the current shell environment.
 
 First test only the browser-backed control-plane access:
 

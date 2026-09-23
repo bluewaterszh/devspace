@@ -219,7 +219,6 @@ start_browser_tunnel() {
     echo "Tunnel ID: $TUNNEL_ID"
     echo "Local MCP: $MCP_URL"
     echo "Browser: $DEVSPACE_BROWSER"
-    echo "Proxy: ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-system/default}}}}"
 
     nohup node "$NODE_ENTRYPOINT" > "$TUNNEL_LOG" 2>&1 < /dev/null &
     TUNNEL_PID=$!
@@ -290,7 +289,6 @@ probe_service() {
     echo "DevSpace control plane: $DEVSPACE_CONTROL_PLANE"
     echo "Tunnel ID: $TUNNEL_ID"
     echo "Browser: $DEVSPACE_BROWSER"
-    echo "Proxy: ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-system/default}}}}"
     echo
     exec node "$NODE_ENTRYPOINT" --probe-only
 }

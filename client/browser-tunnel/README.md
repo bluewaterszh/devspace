@@ -23,7 +23,7 @@ Run in Git Bash / PowerShell from this directory:
 npm install
 ```
 
-Node 22.19+ is required. The PoC uses the installed Chrome or Edge; it does not
+Node 22.16+ is required. The PoC uses the installed Chrome or Edge; it does not
 download a Playwright browser.
 
 ## Run

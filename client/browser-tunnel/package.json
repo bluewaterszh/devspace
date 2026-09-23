@@ -13,7 +13,7 @@
     "check": "node --check bin/devspace-browser-tunnel.mjs && node --check lib/control-plane.mjs && node --check lib/mcp-forwarder.mjs && node --check lib/sse.mjs"
   },
   "engines": {
-    "node": ">=22.19 <27"
+    "node": ">=22.16"
   },
   "dependencies": {
     "playwright-core": "1.63.0"

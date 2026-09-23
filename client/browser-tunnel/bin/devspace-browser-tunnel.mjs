@@ -18,6 +18,7 @@ const { values } = parseArgs({
     browser: { type: "string" },
     "profile-dir": { type: "string" },
     "approve-selector": { type: "string" },
+    "sso-wait-seconds": { type: "string" },
     "probe-only": { type: "boolean" },
     "poll-timeout-ms": { type: "string" },
     "poll-limit": { type: "string" },
@@ -60,6 +61,10 @@ const config = {
       : undefined,
   approveSelector: values["approve-selector"]
     ?? process.env.DEVSPACE_SSO_APPROVE_SELECTOR,
+  ssoWaitMs: 1000 * positiveInt(
+    values["sso-wait-seconds"] ?? process.env.DEVSPACE_SSO_WAIT_SECONDS,
+    180,
+  ),
   probeOnly: values["probe-only"] ?? false,
   pollTimeoutMs: positiveInt(values["poll-timeout-ms"], 30_000),
   pollLimit: positiveInt(values["poll-limit"], 20),
@@ -77,6 +82,7 @@ const control = new BrowserControlPlane({
   profileDir: config.profileDir,
   proxy: config.proxy,
   approveSelector: config.approveSelector,
+  ssoWaitMs: config.ssoWaitMs,
 });
 
 let stopping = false;
@@ -210,6 +216,7 @@ Common options:
   --browser NAME           chrome (default) or msedge
   --profile-dir PATH       Persistent browser profile directory
   --approve-selector CSS   Optional exact SSO approve button selector
+  --sso-wait-seconds N     Wait for browser SSO approval; default: 180
   --probe-only             Verify browser-backed control-plane access and exit
   --poll-timeout-ms N      Default: 30000
   --poll-limit N           Default: 20

@@ -1,8 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
 import { chromium } from "playwright-core";
 
 const CLIENT_NAME = "devspace-browser-tunnel";
@@ -18,6 +16,8 @@ export class BrowserControlPlane {
       ?? join(homedir(), ".devspace-browser-tunnel", this.tunnelId);
     this.proxy = options.proxy;
     this.approveSelector = options.approveSelector;
+    this.ssoWaitMs = options.ssoWaitMs ?? 180_000;
+    this.ssoProbeIntervalMs = options.ssoProbeIntervalMs ?? 2_000;
     this.instanceId = randomBytes(16).toString("hex");
     this.context = undefined;
     this.transportPage = undefined;
@@ -118,24 +118,25 @@ export class BrowserControlPlane {
     }
 
     await this.ssoPage.bringToFront();
-    const rl = createInterface({ input, output });
-    try {
-      await rl.question(
-        "Complete the enterprise SSO/approval in the browser, then press Enter here... ",
-      );
-    } finally {
-      rl.close();
+    console.log(
+      "Complete the enterprise SSO/approval in the browser. "
+        + "The client will detect success automatically.",
+    );
+
+    const deadline = Date.now() + this.ssoWaitMs;
+    while (Date.now() < deadline) {
+      await sleep(this.ssoProbeIntervalMs);
+      probe = await this.metadata();
+      if (isTunnelMetadata(probe, this.tunnelId)) {
+        console.log("browser SSO accepted; control plane is ready.");
+        return;
+      }
     }
 
-    probe = await this.metadata();
-    if (!isTunnelMetadata(probe, this.tunnelId)) {
-      printProbe(probe);
-      throw new Error(
-        "Browser SSO is still not valid for the DevSpace control plane",
-      );
-    }
-
-    console.log("browser SSO accepted; control plane is ready.");
+    printProbe(probe);
+    throw new Error(
+      `Browser SSO did not become valid within ${Math.ceil(this.ssoWaitMs / 1000)}s`,
+    );
   }
 
   async recoverSso(result) {
@@ -235,6 +236,10 @@ function parseJson(text) {
   } catch {
     return undefined;
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function printProbe(result) {

@@ -28,48 +28,73 @@ download a Playwright browser.
 
 ## Run
 
-Example for tunnel `22`:
+Use the same script + per-instance env-file workflow as the original tunnel
+client.
+
+Create an instance env file:
 
 ```bash
-export DEVSPACE_CONTROL_PLANE="https://www.astmars.com"
-export DEVSPACE_TUNNEL_TOKEN="<same tunnel token used by DevSpace>"
-export TUNNEL_ID="tunnel_<32-lowercase-hex>"
-export MCP_URL="http://127.0.0.1:3010/"
-export HTTPS_PROXY="http://<enterprise-proxy-host>:8080"
-
-npm start -- --probe-only
+cp devspace.env.example devspace-22.env
 ```
 
-Use `--probe-only` first. It verifies that the browser-authenticated context
-can call the DevSpace tunnel metadata endpoint and then exits without polling.
-
-After that succeeds, run the full client:
+Edit `devspace-22.env` and set at least:
 
 ```bash
-npm start
+DEVSPACE_CONTROL_PLANE=https://www.astmars.com
+DEVSPACE_TUNNEL_TOKEN=<same tunnel token used by DevSpace>
+TUNNEL_ID=tunnel_<32-lowercase-hex>
+MCP_URL=http://127.0.0.1:3010/
+HTTPS_PROXY=http://<enterprise-proxy-host>:8080
+DEVSPACE_BROWSER=chrome
+```
+
+First test only the browser-backed control-plane access:
+
+```bash
+./devspace-tunnelctl.sh probe devspace-22
+```
+
+The browser opens visibly. Complete the enterprise SSO/approval in the browser.
+No terminal confirmation is required: the client probes every few seconds and
+detects successful approval automatically.
+
+After the probe succeeds, start the full client in the background:
+
+```bash
+./devspace-tunnelctl.sh start devspace-22
+```
+
+Lifecycle commands:
+
+```bash
+./devspace-tunnelctl.sh status devspace-22
+./devspace-tunnelctl.sh log devspace-22
+./devspace-tunnelctl.sh restart devspace-22
+./devspace-tunnelctl.sh stop devspace-22
+```
+
+Each instance uses its own files:
+
+```text
+devspace-22.env
+.devspace-22.browser-tunnel.pid
+.devspace-22.browser-tunnel.log
 ```
 
 The first run creates a dedicated persistent browser profile under
-`~/.devspace-browser-tunnel/<tunnel-id>`. Complete the SSO/approval in the
-browser and press Enter in the terminal when asked.
+`~/.devspace-browser-tunnel/<tunnel-id>`.
 
-To use Edge:
+To use Edge, set this in the env file:
 
 ```bash
-npm start -- --browser msedge
+DEVSPACE_BROWSER=msedge
 ```
 
-If the SSO approval button has a stable CSS selector, it can be automated:
+If the SSO approval button later proves to have a stable CSS selector, automatic
+clicking can be enabled in the env file:
 
 ```bash
-npm start -- --approve-selector '#approve-button'
-```
-
-or:
-
-```bash
-export DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
-npm start
+DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
 ```
 
 ## Security design

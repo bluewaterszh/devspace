@@ -4,3 +4,4 @@ releases/
 .devspace-dev/
 .env
 *.log
+client/browser-tunnel/.*.browser-tunnel.pid

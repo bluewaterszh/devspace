@@ -133,9 +133,8 @@ DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
 
 ## Security design
 
-The tunnel bearer token is not injected into the enterprise SSO page or the
-normal astmars.com website. The client creates a blank, locally-fulfilled
-same-origin page at `https://www.astmars.com/__devspace_browser_tunnel__` and
-executes control-plane `fetch()` calls there.
+The tunnel bearer token is not exposed to the page's normal JavaScript.
+The client keeps a single visible browser tab and executes control-plane
+`fetch()` calls inside a Chrome isolated world attached to that tab.
 
 The enterprise SSO is still handled by the real browser context/profile.

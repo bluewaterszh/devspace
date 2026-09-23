@@ -5,6 +5,7 @@ import { chromium } from "playwright-core";
 
 const CLIENT_NAME = "devspace-browser-tunnel";
 const CLIENT_VERSION = "0.1.0";
+const ISOLATED_WORLD_NAME = "devspace-browser-tunnel";
 
 export class BrowserControlPlane {
   constructor(options) {
@@ -20,8 +21,8 @@ export class BrowserControlPlane {
     this.ssoProbeIntervalMs = options.ssoProbeIntervalMs ?? 2_000;
     this.instanceId = randomBytes(16).toString("hex");
     this.context = undefined;
-    this.transportPage = undefined;
-    this.ssoPage = undefined;
+    this.page = undefined;
+    this.cdp = undefined;
   }
 
   async start() {
@@ -37,24 +38,21 @@ export class BrowserControlPlane {
       launchOptions,
     );
 
-    const bridgeUrl = new URL(
-      "/__devspace_browser_tunnel__",
-      this.baseUrl,
-    ).href;
+    const pages = this.context.pages();
+    this.page = pages[0] ?? await this.context.newPage();
 
-    await this.context.route(bridgeUrl, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "text/html; charset=utf-8",
-        body: "<!doctype html><title>DevSpace Browser Tunnel</title>"
-          + "<body>DevSpace browser transport is active.</body>",
-      });
-    });
+    // Keep exactly one visible tab. The control-plane fetches execute in a
+    // Chrome isolated world attached to this same page, so the bearer token is
+    // not visible to the page's own JavaScript and no extra transport tab is
+    // needed.
+    for (const extraPage of pages.slice(1)) {
+      await extraPage.close().catch(() => {});
+    }
 
-    this.ssoPage = this.context.pages()[0] ?? await this.context.newPage();
-    this.transportPage = await this.context.newPage();
-    await this.transportPage.goto(bridgeUrl, { waitUntil: "domcontentloaded" });
+    this.cdp = await this.context.newCDPSession(this.page);
+    await this.cdp.send("Page.enable");
 
+    await this.openSsoPage();
     await this.ensureAuthorized();
   }
 
@@ -91,22 +89,24 @@ export class BrowserControlPlane {
   }
 
   async ensureAuthorized() {
-    let probe = await this.metadata();
-    if (isTunnelMetadata(probe, this.tunnelId)) {
+    let probe = await this.probeIfSameOrigin();
+    if (probe && isTunnelMetadata(probe, this.tunnelId)) {
       console.log(
         `control plane ready: ${this.baseUrl.origin} tunnel=${this.tunnelId}`,
       );
       return;
     }
 
-    console.log("control-plane request is not authenticated through the browser.");
-    printProbe(probe);
+    if (probe) {
+      console.log("control-plane request is not authenticated through the browser.");
+      printProbe(probe);
+    }
 
-    await this.openSsoPage();
+    await this.page.bringToFront();
 
     if (this.approveSelector) {
       try {
-        const button = this.ssoPage.locator(this.approveSelector).first();
+        const button = this.page.locator(this.approveSelector).first();
         await button.waitFor({ state: "visible", timeout: 10_000 });
         console.log(`auto-clicking SSO selector: ${this.approveSelector}`);
         await button.click();
@@ -117,7 +117,6 @@ export class BrowserControlPlane {
       }
     }
 
-    await this.ssoPage.bringToFront();
     console.log(
       "Complete the enterprise SSO/approval in the browser. "
         + "The client will detect success automatically.",
@@ -126,14 +125,15 @@ export class BrowserControlPlane {
     const deadline = Date.now() + this.ssoWaitMs;
     while (Date.now() < deadline) {
       await sleep(this.ssoProbeIntervalMs);
-      probe = await this.metadata();
-      if (isTunnelMetadata(probe, this.tunnelId)) {
+
+      probe = await this.probeIfSameOrigin();
+      if (probe && isTunnelMetadata(probe, this.tunnelId)) {
         console.log("browser SSO accepted; control plane is ready.");
         return;
       }
     }
 
-    printProbe(probe);
+    if (probe) printProbe(probe);
     throw new Error(
       `Browser SSO did not become valid within ${Math.ceil(this.ssoWaitMs / 1000)}s`,
     );
@@ -142,12 +142,13 @@ export class BrowserControlPlane {
   async recoverSso(result) {
     console.warn("control-plane browser session needs SSO approval again.");
     printProbe(result);
+    await this.openSsoPage();
     await this.ensureAuthorized();
   }
 
   async openSsoPage() {
     try {
-      await this.ssoPage.goto(this.baseUrl.origin + "/", {
+      await this.page.goto(this.baseUrl.origin + "/", {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
@@ -158,8 +159,28 @@ export class BrowserControlPlane {
     }
   }
 
+  async probeIfSameOrigin() {
+    if (!this.page || !sameOrigin(this.page.url(), this.baseUrl.origin)) {
+      return undefined;
+    }
+    return this.metadata();
+  }
+
   async request(path, init = {}) {
     const url = new URL(path, this.baseUrl).href;
+
+    if (!this.page || !sameOrigin(this.page.url(), this.baseUrl.origin)) {
+      return {
+        networkError: `browser page is not at control-plane origin: ${this.page?.url() ?? "unavailable"}`,
+        status: 0,
+        url,
+        redirected: false,
+        contentType: "",
+        text: "",
+        json: undefined,
+      };
+    }
+
     const headers = {
       Authorization: `Bearer ${this.token}`,
       "X-Tunnel-Client-Name": CLIENT_NAME,
@@ -172,47 +193,87 @@ export class BrowserControlPlane {
       ...(init.headers ?? {}),
     };
 
-    const result = await this.transportPage.evaluate(
-      async ({ url, method, headers, body }) => {
-        try {
-          const response = await fetch(url, {
-            method,
-            headers,
-            body,
-            credentials: "include",
-            cache: "no-store",
-            redirect: "follow",
-          });
-          const text = await response.text();
-          return {
-            networkError: null,
-            status: response.status,
-            url: response.url,
-            redirected: response.redirected,
-            contentType: response.headers.get("content-type") ?? "",
-            text,
-          };
-        } catch (error) {
-          return {
-            networkError: String(error),
-            status: 0,
-            url,
-            redirected: false,
-            contentType: "",
-            text: "",
-          };
-        }
-      },
-      {
+    let result;
+    try {
+      result = await this.evaluateIsolatedFetch({
         url,
         method: init.method ?? "GET",
         headers,
         body: init.body ?? null,
-      },
-    );
+      });
+    } catch (error) {
+      result = {
+        networkError: String(error),
+        status: 0,
+        url,
+        redirected: false,
+        contentType: "",
+        text: "",
+      };
+    }
 
     result.json = parseJson(result.text);
     return result;
+  }
+
+  async evaluateIsolatedFetch(args) {
+    const frameTree = await this.cdp.send("Page.getFrameTree");
+    const frameId = frameTree.frameTree.frame.id;
+    const world = await this.cdp.send("Page.createIsolatedWorld", {
+      frameId,
+      worldName: ISOLATED_WORLD_NAME,
+      grantUniveralAccess: false,
+    });
+
+    const serialized = JSON.stringify(args);
+    const expression = `(async () => {
+      const { url, method, headers, body } = ${serialized};
+      try {
+        const response = await fetch(url, {
+          method,
+          headers,
+          body,
+          credentials: "include",
+          cache: "no-store",
+          redirect: "follow",
+        });
+        const text = await response.text();
+        return {
+          networkError: null,
+          status: response.status,
+          url: response.url,
+          redirected: response.redirected,
+          contentType: response.headers.get("content-type") ?? "",
+          text,
+        };
+      } catch (error) {
+        return {
+          networkError: String(error),
+          status: 0,
+          url,
+          redirected: false,
+          contentType: "",
+          text: "",
+        };
+      }
+    })()`;
+
+    const evaluated = await this.cdp.send("Runtime.evaluate", {
+      expression,
+      contextId: world.executionContextId,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+
+    if (evaluated.exceptionDetails) {
+      throw new Error(
+        evaluated.exceptionDetails.exception?.description
+          ?? evaluated.exceptionDetails.text
+          ?? "isolated browser fetch failed",
+      );
+    }
+
+    return evaluated.result.value;
   }
 }
 
@@ -235,6 +296,14 @@ function parseJson(text) {
     return JSON.parse(text);
   } catch {
     return undefined;
+  }
+}
+
+function sameOrigin(value, expectedOrigin) {
+  try {
+    return new URL(value).origin === expectedOrigin;
+  } catch {
+    return false;
   }
 }
 

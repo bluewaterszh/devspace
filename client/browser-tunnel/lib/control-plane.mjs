@@ -15,7 +15,6 @@ export class BrowserControlPlane {
     this.browserChannel = options.browserChannel ?? "chrome";
     this.profileDir = options.profileDir
       ?? join(homedir(), ".devspace-browser-tunnel", this.tunnelId);
-    this.proxy = options.proxy;
     this.approveSelector = options.approveSelector;
     this.ssoWaitMs = options.ssoWaitMs ?? 180_000;
     this.ssoProbeIntervalMs = options.ssoProbeIntervalMs ?? 2_000;
@@ -31,8 +30,6 @@ export class BrowserControlPlane {
       headless: false,
       viewport: null,
     };
-    if (this.proxy) launchOptions.proxy = { server: this.proxy };
-
     this.context = await chromium.launchPersistentContext(
       this.profileDir,
       launchOptions,

@@ -14,7 +14,6 @@ const { values } = parseArgs({
     "control-plane": { type: "string" },
     "tunnel-id": { type: "string" },
     "mcp-url": { type: "string" },
-    proxy: { type: "string" },
     browser: { type: "string" },
     "profile-dir": { type: "string" },
     "approve-selector": { type: "string" },
@@ -46,11 +45,6 @@ const config = {
     ?? process.env.MCP_URL
     ?? process.env.MCP_SERVER_URL
     ?? "http://127.0.0.1:3010/",
-  proxy: values.proxy
-    ?? process.env.HTTPS_PROXY
-    ?? process.env.https_proxy
-    ?? process.env.HTTP_PROXY
-    ?? process.env.http_proxy,
   browserChannel: values.browser
     ?? process.env.DEVSPACE_BROWSER
     ?? "chrome",
@@ -83,7 +77,6 @@ const control = new BrowserControlPlane({
   token: config.token,
   browserChannel: config.browserChannel,
   profileDir: config.profileDir,
-  proxy: config.proxy,
   approveSelector: config.approveSelector,
   ssoWaitMs: config.ssoWaitMs,
 });
@@ -101,7 +94,7 @@ try {
   console.log(
     `starting browser tunnel tunnel=${config.tunnelId} `
       + `control=${config.controlPlane} mcp=${config.mcpUrl} `
-      + `browser=${config.browserChannel} proxy=${config.proxy ? "configured" : "system/default"}`,
+      + `browser=${config.browserChannel}`,
   );
 
   await control.start();
@@ -216,7 +209,6 @@ Common options:
   --control-plane URL      Default: https://www.astmars.com
   --tunnel-id ID           Tunnel id
   --mcp-url URL            Default: http://127.0.0.1:3010/
-  --proxy URL              Browser proxy; defaults to HTTPS_PROXY/HTTP_PROXY
   --browser NAME           chrome (default) or msedge
   --profile-dir PATH       Persistent browser profile directory
   --approve-selector CSS   Optional exact SSO approve button selector

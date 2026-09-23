@@ -63,16 +63,9 @@ DEVSPACE_BROWSER=chrome
 `MCP_URL` normally does not need to be set; it is derived as
 `http://127.0.0.1:$MCP_PORT/`.
 
-If this machine must use an enterprise proxy, export it in the shell before
-running the control script, for example:
-
-```bash
-export HTTPS_PROXY=http://proxy-host:8080
-export HTTP_PROXY=http://proxy-host:8080
-```
-
-The control script does not parse or manage proxy settings; the child browser
-client simply inherits the current shell environment.
+The browser client does not read `HTTP_PROXY` / `HTTPS_PROXY` and does not force
+a Playwright proxy. Chrome/Edge uses the normal Windows system proxy/PAC and
+enterprise browser networking, matching the user's normal browser behavior.
 
 First test only the browser-backed control-plane access:
 

@@ -1,0 +1,21 @@
+{
+  "name": "@bluewaterszh/devspace-browser-tunnel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-backed DevSpace tunnel client for enterprise SSO environments.",
+  "type": "module",
+  "bin": {
+    "devspace-browser-tunnel": "bin/devspace-browser-tunnel.mjs"
+  },
+  "scripts": {
+    "start": "node bin/devspace-browser-tunnel.mjs",
+    "test": "node --test",
+    "check": "node --check bin/devspace-browser-tunnel.mjs && node --check lib/control-plane.mjs && node --check lib/mcp-forwarder.mjs && node --check lib/sse.mjs"
+  },
+  "engines": {
+    "node": ">=22.19 <27"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

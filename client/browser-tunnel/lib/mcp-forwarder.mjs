@@ -11,13 +11,18 @@ const RESPONSE_HEADER_ALLOWLIST = [
 
 export async function processTunnelCommand(
   command,
-  { mcpUrl, deliver, receivedAtMs = Date.now() },
+  { mcpUrl, mcpAuthorization, deliver, receivedAtMs = Date.now() },
 ) {
   const deadlineAt = commandDeadline(command, receivedAtMs);
   if (deadlineAt !== undefined && Date.now() >= deadlineAt) return;
 
   if (command.command_type === "session_termination") {
-    await processSessionTermination(command, { mcpUrl, deliver, deadlineAt });
+    await processSessionTermination(command, {
+      mcpUrl,
+      mcpAuthorization,
+      deliver,
+      deadlineAt,
+    });
     return;
   }
 
@@ -26,7 +31,12 @@ export async function processTunnelCommand(
   }
 
   try {
-    await processJsonRpc(command, { mcpUrl, deliver, deadlineAt });
+    await processJsonRpc(command, {
+      mcpUrl,
+      mcpAuthorization,
+      deliver,
+      deadlineAt,
+    });
   } catch (error) {
     console.error(
       `MCP command failed request_id=${command.request_id}: `
@@ -36,7 +46,10 @@ export async function processTunnelCommand(
   }
 }
 
-async function processJsonRpc(command, { mcpUrl, deliver, deadlineAt }) {
+async function processJsonRpc(
+  command,
+  { mcpUrl, mcpAuthorization, deliver, deadlineAt },
+) {
   const payload = command.jsonrpc;
   const hasId = payload
     && typeof payload === "object"
@@ -46,7 +59,7 @@ async function processJsonRpc(command, { mcpUrl, deliver, deadlineAt }) {
     mcpUrl,
     {
       method: "POST",
-      headers: requestHeaders(command.headers, true),
+      headers: requestHeaders(command.headers, true, mcpAuthorization),
       body: JSON.stringify(payload),
       redirect: "manual",
     },
@@ -134,14 +147,14 @@ async function processJsonRpc(command, { mcpUrl, deliver, deadlineAt }) {
 
 async function processSessionTermination(
   command,
-  { mcpUrl, deliver, deadlineAt },
+  { mcpUrl, mcpAuthorization, deliver, deadlineAt },
 ) {
   try {
     const response = await fetchWithDeadline(
       mcpUrl,
       {
         method: "DELETE",
-        headers: requestHeaders(command.headers, false),
+        headers: requestHeaders(command.headers, false, mcpAuthorization),
         redirect: "manual",
       },
       deadlineAt,
@@ -203,7 +216,7 @@ async function deliverFailure(command, deliver) {
   });
 }
 
-function requestHeaders(values, includeJsonContentType) {
+function requestHeaders(values, includeJsonContentType, mcpAuthorization) {
   const headers = new Headers();
 
   for (const [name, rawValues] of Object.entries(values ?? {})) {
@@ -216,6 +229,9 @@ function requestHeaders(values, includeJsonContentType) {
   }
   if (!headers.has("accept")) {
     headers.set("Accept", "application/json, text/event-stream");
+  }
+  if (mcpAuthorization) {
+    headers.set("Authorization", mcpAuthorization);
   }
 
   return headers;

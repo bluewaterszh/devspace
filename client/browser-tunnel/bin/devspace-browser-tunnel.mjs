@@ -69,6 +69,9 @@ const config = {
   pollTimeoutMs: positiveInt(values["poll-timeout-ms"], 30_000),
   pollLimit: positiveInt(values["poll-limit"], 20),
   concurrency: positiveInt(values.concurrency, 4),
+  mcpAuthorization: process.env.MCP_TOKEN
+    ? `Bearer ${process.env.MCP_TOKEN}`
+    : undefined,
 };
 
 if (!config.tunnelId) fail("missing --tunnel-id or TUNNEL_ID");
@@ -141,6 +144,7 @@ try {
 
         const task = processTunnelCommand(command, {
           mcpUrl: config.mcpUrl,
+          mcpAuthorization: config.mcpAuthorization,
           receivedAtMs,
           deliver: async (sourceCommand, payload) => {
             let result = await control.postResponse(sourceCommand, payload);

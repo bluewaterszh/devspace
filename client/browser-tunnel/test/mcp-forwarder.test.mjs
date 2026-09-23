@@ -19,6 +19,7 @@ async function withServer(handler, fn) {
 
 test("forwards SSE final response and MCP session header", async () => {
   await withServer((req, res) => {
+    assert.equal(req.headers.authorization, "Bearer local-mcp-token");
     let body = "";
     req.on("data", (chunk) => body += chunk);
     req.on("end", () => {
@@ -52,6 +53,7 @@ test("forwards SSE final response and MCP session header", async () => {
       },
     }, {
       mcpUrl,
+      mcpAuthorization: "Bearer local-mcp-token",
       deliver: async (_command, payload) => delivered.push(payload),
     });
 
@@ -106,6 +108,7 @@ test("forwards session termination as DELETE", async () => {
   await withServer((req, res) => {
     assert.equal(req.method, "DELETE");
     assert.equal(req.headers["mcp-session-id"], "session-123");
+    assert.equal(req.headers.authorization, "Bearer local-mcp-token");
     res.statusCode = 200;
     res.end();
   }, async (mcpUrl) => {
@@ -121,6 +124,7 @@ test("forwards session termination as DELETE", async () => {
       },
     }, {
       mcpUrl,
+      mcpAuthorization: "Bearer local-mcp-token",
       deliver: async (_command, payload) => delivered.push(payload),
     });
 

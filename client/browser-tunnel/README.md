@@ -37,16 +37,32 @@ Create an instance env file:
 cp devspace.env.example devspace-22.env
 ```
 
-Edit `devspace-22.env` and set at least:
+Edit `devspace-22.env` and set the SSH target plus tunnel settings:
 
 ```bash
+SSH_HOST=<remote-host>
+SSH_PORT=22
+SSH_USER=<remote-user>
+SSH_PASSWORD=<remote-password>
+WORKDIR=~
+
+SSH_MCP_TIMING=1
+SSH_GROUP=dev
+SSH_AUTH_MODE=password
+
+MCP_PORT=3010
+MCP_TOKEN=test-123456
+
 DEVSPACE_CONTROL_PLANE=https://www.astmars.com
 DEVSPACE_TUNNEL_TOKEN=<same tunnel token used by DevSpace>
 TUNNEL_ID=tunnel_<32-lowercase-hex>
-MCP_URL=http://127.0.0.1:3010/
+
 HTTPS_PROXY=http://<enterprise-proxy-host>:8080
 DEVSPACE_BROWSER=chrome
 ```
+
+`MCP_URL` normally does not need to be set; it is derived as
+`http://127.0.0.1:$MCP_PORT/`.
 
 First test only the browser-backed control-plane access:
 
@@ -58,17 +74,23 @@ The browser opens visibly. Complete the enterprise SSO/approval in the browser.
 No terminal confirmation is required: the client probes every few seconds and
 detects successful approval automatically.
 
-After the probe succeeds, start the full client in the background:
+After the probe succeeds, start the full stack in the background:
 
 ```bash
 ./devspace-tunnelctl.sh start devspace-22
 ```
+
+`start` first launches `ssh-mcp` with the SSH settings from the env file,
+then launches the browser-backed tunnel client. If `MCP_TOKEN` is configured,
+the browser client automatically sends the same bearer token to the local
+`ssh-mcp` endpoint.
 
 Lifecycle commands:
 
 ```bash
 ./devspace-tunnelctl.sh status devspace-22
 ./devspace-tunnelctl.sh log devspace-22
+./devspace-tunnelctl.sh ssh-log devspace-22
 ./devspace-tunnelctl.sh restart devspace-22
 ./devspace-tunnelctl.sh stop devspace-22
 ```
@@ -77,6 +99,8 @@ Each instance uses its own files:
 
 ```text
 devspace-22.env
+.devspace-22.ssh-mcp.pid
+.devspace-22.ssh-mcp.log
 .devspace-22.browser-tunnel.pid
 .devspace-22.browser-tunnel.log
 ```

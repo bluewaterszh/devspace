@@ -60,6 +60,12 @@ SSH_LOG="$BASE_DIR/.$PROFILE.ssh-mcp.log"
 TUNNEL_LOG="$BASE_DIR/.$PROFILE.browser-tunnel.log"
 ENTRYPOINT="$BASE_DIR/bin/devspace-browser-tunnel.mjs"
 
+if command -v cygpath >/dev/null 2>&1; then
+    NODE_ENTRYPOINT="$(cygpath -w "$ENTRYPOINT")"
+else
+    NODE_ENTRYPOINT="$ENTRYPOINT"
+fi
+
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 export DEVSPACE_CONTROL_PLANE
@@ -215,7 +221,7 @@ start_browser_tunnel() {
     echo "Browser: $DEVSPACE_BROWSER"
     echo "Proxy: ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-system/default}}}}"
 
-    nohup node "$ENTRYPOINT" > "$TUNNEL_LOG" 2>&1 < /dev/null &
+    nohup node "$NODE_ENTRYPOINT" > "$TUNNEL_LOG" 2>&1 < /dev/null &
     TUNNEL_PID=$!
     echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
 
@@ -286,7 +292,7 @@ probe_service() {
     echo "Browser: $DEVSPACE_BROWSER"
     echo "Proxy: ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-system/default}}}}"
     echo
-    exec node "$ENTRYPOINT" --probe-only
+    exec node "$NODE_ENTRYPOINT" --probe-only
 }
 
 stop_process() {

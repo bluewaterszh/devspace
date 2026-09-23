@@ -57,11 +57,31 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await Promise.all([
+
+    // Stop accepting new connections first, then actively drain relay state.
+    // Tunnel long-polls and MCP/SSE requests otherwise keep server.close()
+    // waiting until systemd reaches its stop timeout.
+    const serversClosing = Promise.all([
       closeHttpServer(openaiServer),
       closeHttpServer(tunnelServer),
     ]);
     await applications.close();
+
+    // Caddy keeps the tunnel control connection alive and can immediately
+    // reuse it for another long-poll while the server is draining. Give
+    // in-flight responses a brief grace period, then force-close the
+    // remaining backend sockets so systemd restart cannot hang indefinitely.
+    const forceCloseTimer = setTimeout(() => {
+      openaiServer.closeAllConnections();
+      tunnelServer.closeAllConnections();
+    }, 1000);
+    forceCloseTimer.unref?.();
+
+    try {
+      await serversClosing;
+    } finally {
+      clearTimeout(forceCloseTimer);
+    }
   };
 
   const handleSignal = () => {

@@ -51,6 +51,7 @@ DEVSPACE_CONTROL_PLANE="${DEVSPACE_CONTROL_PLANE:-https://www.astmars.com}"
 DEVSPACE_TUNNEL_TOKEN="${DEVSPACE_TUNNEL_TOKEN:-}"
 TUNNEL_ID="${TUNNEL_ID:-}"
 DEVSPACE_BROWSER="${DEVSPACE_BROWSER:-chrome}"
+DEVSPACE_BROWSER_WATCHDOG_SECONDS="${DEVSPACE_BROWSER_WATCHDOG_SECONDS:-15}"
 DEVSPACE_SSO_WAIT_SECONDS="${DEVSPACE_SSO_WAIT_SECONDS:-180}"
 MCP_URL="${MCP_URL:-http://127.0.0.1:$MCP_PORT/}"
 
@@ -72,6 +73,7 @@ export DEVSPACE_CONTROL_PLANE
 export DEVSPACE_TUNNEL_TOKEN
 export TUNNEL_ID
 export DEVSPACE_BROWSER
+export DEVSPACE_BROWSER_WATCHDOG_SECONDS
 export DEVSPACE_SSO_WAIT_SECONDS
 export MCP_URL
 export MCP_TOKEN
@@ -219,6 +221,7 @@ start_browser_tunnel() {
     echo "Tunnel ID: $TUNNEL_ID"
     echo "Local MCP: $MCP_URL"
     echo "Browser: $DEVSPACE_BROWSER"
+    echo "Browser watchdog: ${DEVSPACE_BROWSER_WATCHDOG_SECONDS}s"
 
     nohup node "$NODE_ENTRYPOINT" > "$TUNNEL_LOG" 2>&1 < /dev/null &
     TUNNEL_PID=$!
@@ -356,6 +359,7 @@ status_service() {
 
     if is_running "$TUNNEL_PID_FILE"; then
         echo "browser-tunnel: RUNNING PID=$(cat "$TUNNEL_PID_FILE")"
+        echo "  watchdog: ${DEVSPACE_BROWSER_WATCHDOG_SECONDS}s"
         echo "  log: $TUNNEL_LOG"
     else
         echo "browser-tunnel: STOPPED"

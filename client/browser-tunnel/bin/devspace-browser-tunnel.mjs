@@ -18,6 +18,7 @@ const { values } = parseArgs({
     "profile-dir": { type: "string" },
     "approve-selector": { type: "string" },
     "sso-wait-seconds": { type: "string" },
+    "browser-watchdog-seconds": { type: "string" },
     "probe-only": { type: "boolean" },
     "poll-timeout-ms": { type: "string" },
     "poll-limit": { type: "string" },
@@ -59,6 +60,11 @@ const config = {
     values["sso-wait-seconds"] ?? process.env.DEVSPACE_SSO_WAIT_SECONDS,
     180,
   ),
+  watchdogIntervalMs: 1000 * positiveInt(
+    values["browser-watchdog-seconds"]
+      ?? process.env.DEVSPACE_BROWSER_WATCHDOG_SECONDS,
+    15,
+  ),
   probeOnly: values["probe-only"] ?? false,
   pollTimeoutMs: positiveInt(values["poll-timeout-ms"], 30_000),
   pollLimit: positiveInt(values["poll-limit"], 20),
@@ -79,6 +85,7 @@ const control = new BrowserControlPlane({
   profileDir: config.profileDir,
   approveSelector: config.approveSelector,
   ssoWaitMs: config.ssoWaitMs,
+  watchdogIntervalMs: config.watchdogIntervalMs,
 });
 
 let stopping = false;
@@ -97,22 +104,28 @@ try {
       + `browser=${config.browserChannel}`,
   );
 
-  await control.start();
-
   if (config.probeOnly) {
+    await control.start();
     console.log("probe-only succeeded; browser-backed control plane is usable.");
     process.exitCode = 0;
   } else {
+    try {
+      await control.start();
+    } catch (error) {
+      console.warn(
+        `initial browser/session setup needs recovery: ${errorMessage(error)}`,
+      );
+      await recoverUntilReady("initial browser/session setup");
+    }
+
     while (!stopping) {
       let polled;
 
       try {
         polled = await control.poll(config.pollLimit, config.pollTimeoutMs);
       } catch (error) {
-        console.warn(
-          `poll browser fetch failed: ${error instanceof Error ? error.message : error}`,
-        );
-        await control.ensureAuthorized();
+        console.warn(`poll browser fetch failed: ${errorMessage(error)}`);
+        await recoverUntilReady("poll browser fetch failed");
         continue;
       }
 
@@ -125,7 +138,7 @@ try {
         || polled.status !== 200
         || !Array.isArray(polled.json?.commands)
       ) {
-        await control.recoverSso(polled);
+        await recoverUntilReady("poll response requires browser/session recovery", polled);
         continue;
       }
 
@@ -146,7 +159,10 @@ try {
               || result.status !== 200
               || result.json?.status !== "ok"
             ) {
-              await control.recoverSso(result);
+              await recoverUntilReady(
+                `response delivery recovery request_id=${sourceCommand.request_id}`,
+                result,
+              );
               result = await control.postResponse(sourceCommand, payload);
             }
 
@@ -178,6 +194,35 @@ try {
   await Promise.allSettled(active);
 } finally {
   await control.close();
+}
+
+async function recoverUntilReady(reason, result) {
+  let attempt = 0;
+  let diagnostic = result;
+
+  while (!stopping) {
+    attempt += 1;
+    try {
+      await control.recover(reason, diagnostic);
+      return true;
+    } catch (error) {
+      console.warn(
+        `AUTH_RECOVERY_PENDING attempt=${attempt} reason=${reason}: ${errorMessage(error)}`,
+      );
+      diagnostic = undefined;
+      await sleep(Math.min(10_000, 2_000 * attempt));
+    }
+  }
+
+  return false;
+}
+
+function sleep(ms) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error ?? "unknown error");
 }
 
 function positiveInt(raw, fallback) {
@@ -212,7 +257,9 @@ Common options:
   --browser NAME           chrome (default) or msedge
   --profile-dir PATH       Persistent browser profile directory
   --approve-selector CSS   Optional exact SSO approve button selector
-  --sso-wait-seconds N     Wait for browser SSO approval; default: 180
+  --sso-wait-seconds N     Wait per SSO recovery attempt; default: 180
+  --browser-watchdog-seconds N
+                           Detect/relaunch a closed browser; default: 15
   --probe-only             Verify browser-backed control-plane access and exit
   --poll-timeout-ms N      Default: 30000
   --poll-limit N           Default: 20

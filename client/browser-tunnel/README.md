@@ -111,6 +111,17 @@ devspace-22.env
 The first run creates a dedicated persistent browser profile under
 `~/.devspace-browser-tunnel/<tunnel-id>`.
 
+The long-running client now treats that browser as a recoverable transport. If
+the Chrome/Edge window, browser context, or transport tab is closed, a watchdog
+relaunches the same persistent profile automatically. If the enterprise session
+has expired, the client keeps running and retries SSO recovery instead of
+exiting after one timeout. The default watchdog interval is 15 seconds and can
+be changed with:
+
+```bash
+DEVSPACE_BROWSER_WATCHDOG_SECONDS=15
+```
+
 To use Edge, set this in the env file:
 
 ```bash
@@ -123,6 +134,12 @@ clicking can be enabled in the env file:
 ```bash
 DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
 ```
+
+During SSO recovery the client retries that selector periodically, so a button
+that appears after a redirect or delayed page load is not missed. If no stable
+selector is configured and the enterprise page requires human approval, the
+browser stays open and the client logs `AUTH_RECOVERY_PENDING` while waiting
+for the next recovery attempt.
 
 ## Security design
 

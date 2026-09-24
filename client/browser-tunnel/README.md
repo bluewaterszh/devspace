@@ -128,18 +128,26 @@ To use Edge, set this in the env file:
 DEVSPACE_BROWSER=msedge
 ```
 
-If the SSO approval button later proves to have a stable CSS selector, automatic
-clicking can be enabled in the env file:
+SSO approval is auto-clicked by default. The client recognizes the current
+enterprise interstitial action `接受风险并访问` with highest priority, plus
+common positive actions such as Continue / Approve / Allow / Sign in / 继续 /
+允许 / 授权 / 登录. Explicit negative actions such as Cancel / Deny / Back /
+取消 / 拒绝 / 返回 are never selected.
+
+To disable text-based auto approval:
+
+```bash
+DEVSPACE_SSO_AUTO_APPROVE=0
+```
+
+If a future SSO page needs an exact selector, it can still be configured:
 
 ```bash
 DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
 ```
 
-During SSO recovery the client retries that selector periodically, so a button
-that appears after a redirect or delayed page load is not missed. If no stable
-selector is configured and the enterprise page requires human approval, the
-browser stays open and the client logs `AUTH_RECOVERY_PENDING` while waiting
-for the next recovery attempt.
+During SSO recovery the client retries the selector/text match periodically, so
+an action that appears after a redirect or delayed page load is not missed.
 
 ## Security design
 

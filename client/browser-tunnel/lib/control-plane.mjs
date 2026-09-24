@@ -16,6 +16,7 @@ export class BrowserControlPlane {
     this.profileDir = options.profileDir
       ?? join(homedir(), ".devspace-browser-tunnel", this.tunnelId);
     this.approveSelector = options.approveSelector;
+    this.autoApprove = options.autoApprove ?? true;
     this.ssoWaitMs = options.ssoWaitMs ?? 180_000;
     this.ssoProbeIntervalMs = options.ssoProbeIntervalMs ?? 2_000;
     this.watchdogIntervalMs = options.watchdogIntervalMs ?? 15_000;
@@ -28,6 +29,7 @@ export class BrowserControlPlane {
     this.recoveryPromise = undefined;
     this.watchdogTimer = undefined;
     this.stopping = false;
+    this.lastSsoCandidateLogAt = 0;
   }
 
   async start() {
@@ -250,7 +252,10 @@ export class BrowserControlPlane {
         throw new Error("browser was closed while waiting for SSO approval");
       }
 
-      if (this.approveSelector && Date.now() - lastClickAt >= 2_000) {
+      if (
+        (this.approveSelector || this.autoApprove)
+        && Date.now() - lastClickAt >= 2_000
+      ) {
         lastClickAt = Date.now();
         await this.tryApproveSso();
       }
@@ -271,18 +276,114 @@ export class BrowserControlPlane {
   }
 
   async tryApproveSso() {
-    if (!this.approveSelector || !this.page || this.page.isClosed()) return;
+    if (!this.page || this.page.isClosed()) return false;
+
+    if (this.approveSelector) {
+      try {
+        const button = this.page.locator(this.approveSelector).first();
+        if (await button.isVisible({ timeout: 500 }).catch(() => false)) {
+          console.log(`auto-clicking SSO selector: ${this.approveSelector}`);
+          await button.click({ timeout: 5_000 });
+          return true;
+        }
+      } catch (error) {
+        console.warn(
+          `automatic SSO selector click did not complete: ${errorMessage(error)}`,
+        );
+      }
+    }
+
+    if (!this.autoApprove) return false;
+
+    const candidates = await this.collectSsoActionCandidates();
+    const action = selectSsoAction(candidates, {
+      allowSingleFallback: !sameOrigin(this.page.url(), this.baseUrl.origin),
+    });
+
+    if (!action) {
+      this.logSsoCandidates(candidates);
+      return false;
+    }
+
+    console.log(
+      `auto-clicking SSO action label=${JSON.stringify(action.label)} `
+        + `kind=${action.kind} url=${action.frameUrl}`,
+    );
 
     try {
-      const button = this.page.locator(this.approveSelector).first();
-      if (!await button.isVisible({ timeout: 500 }).catch(() => false)) return;
-      console.log(`auto-clicking SSO selector: ${this.approveSelector}`);
-      await button.click({ timeout: 5_000 });
+      await action.locator.click({ timeout: 5_000 });
+      return true;
     } catch (error) {
       console.warn(
-        `automatic SSO click did not complete: ${errorMessage(error)}`,
+        `automatic SSO action click did not complete: ${errorMessage(error)}`,
       );
+      return false;
     }
+  }
+
+  async collectSsoActionCandidates() {
+    const selector = [
+      "button",
+      'input[type="submit"]',
+      'input[type="button"]',
+      "a",
+      '[role="button"]',
+    ].join(",");
+
+    const candidates = [];
+    for (const frame of this.page.frames()) {
+      const controls = frame.locator(selector);
+      const count = Math.min(await controls.count().catch(() => 0), 30);
+
+      for (let index = 0; index < count; index += 1) {
+        const locator = controls.nth(index);
+        const visible = await locator.isVisible({ timeout: 250 }).catch(() => false);
+        if (!visible) continue;
+        const enabled = await locator.isEnabled({ timeout: 250 }).catch(() => false);
+        if (!enabled) continue;
+
+        const details = await locator.evaluate((element) => {
+          const tag = element.tagName.toLowerCase();
+          const type = (element.getAttribute("type") ?? "").toLowerCase();
+          const label = [
+            element.innerText,
+            element.getAttribute("value"),
+            element.getAttribute("aria-label"),
+            element.getAttribute("title"),
+          ].find((value) => value && value.trim()) ?? "";
+          return { tag, type, label: label.replace(/\s+/g, " ").trim() };
+        }).catch(() => undefined);
+
+        if (!details?.label) continue;
+        candidates.push({
+          ...details,
+          kind: details.tag === "input"
+            ? `input:${details.type || "button"}`
+            : details.tag,
+          frameUrl: frame.url(),
+          locator,
+        });
+      }
+    }
+
+    return candidates;
+  }
+
+  logSsoCandidates(candidates) {
+    if (Date.now() - this.lastSsoCandidateLogAt < 10_000) return;
+    this.lastSsoCandidateLogAt = Date.now();
+
+    console.log(
+      "SSO_AUTO_APPROVE_WAITING "
+        + JSON.stringify({
+          pageUrl: this.page?.url(),
+          candidates: candidates.slice(0, 12).map((candidate) => ({
+            label: candidate.label,
+            kind: candidate.kind,
+            frameUrl: candidate.frameUrl,
+          })),
+        }),
+    );
   }
 
   async recover(reason = "control-plane recovery", result) {
@@ -441,6 +542,73 @@ export class BrowserControlPlane {
 
     return evaluated.result.value;
   }
+}
+
+export function selectSsoAction(candidates, options = {}) {
+  const ranked = candidates
+    .map((candidate) => ({
+      candidate,
+      score: scoreSsoAction(candidate.label, candidate.kind),
+    }))
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  if (ranked.length > 0) {
+    const best = ranked[0];
+    const second = ranked[1];
+    if (!second || best.score > second.score) return best.candidate;
+
+    const tied = ranked.filter(({ score }) => score === best.score);
+    if (tied.length === 1) return best.candidate;
+  }
+
+  if (!options.allowSingleFallback) return undefined;
+
+  const fallback = candidates.filter((candidate) => {
+    if (isNegativeSsoLabel(candidate.label)) return false;
+    return candidate.kind === "button"
+      || candidate.kind === "input:submit";
+  });
+
+  return fallback.length === 1 ? fallback[0] : undefined;
+}
+
+function scoreSsoAction(label, kind) {
+  const text = normalizeSsoLabel(label);
+  if (!text || isNegativeSsoLabel(text)) return 0;
+
+  const strong = [
+    /^(接受风险并访问)$/,
+    /^(accept risk and (visit|continue|proceed))$/,
+    /^(continue|proceed|approve|allow|authorize|confirm|verify|next)$/,
+    /^(sign\s*in|log\s*in|login)$/,
+    /^(继续|继续访问|确认|同意|允许|授权|登录|登入|验证|下一步)$/,
+  ];
+  const positive = [
+    /\b(continue|proceed|approve|allow|authorize|confirm|verify|next)\b/,
+    /\b(sign\s*in|log\s*in|login)\b/,
+    /(继续|确认|同意|允许|授权|登录|登入|验证|下一步)/,
+    /(click\s+here|点击此处|点击这里)/,
+  ];
+
+  let score = 0;
+  if (strong.some((pattern) => pattern.test(text))) score = 100;
+  else if (positive.some((pattern) => pattern.test(text))) score = 70;
+  if (score === 0) return 0;
+
+  if (kind === "button" || kind === "input:submit") score += 10;
+  else if (kind === "input:button") score += 5;
+  return score;
+}
+
+function isNegativeSsoLabel(label) {
+  const text = normalizeSsoLabel(label);
+  return /\b(cancel|deny|decline|reject|back|sign\s*out|log\s*out|logout)\b/.test(text)
+    || /(取消|拒绝|不同意|返回|退出)/.test(text);
+}
+
+function normalizeSsoLabel(label) {
+  return String(label ?? "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 export function isControlPlaneResponse(result) {

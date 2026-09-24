@@ -56,6 +56,7 @@ const config = {
       : undefined,
   approveSelector: values["approve-selector"]
     ?? process.env.DEVSPACE_SSO_APPROVE_SELECTOR,
+  autoApprove: envFlag(process.env.DEVSPACE_SSO_AUTO_APPROVE, true),
   ssoWaitMs: 1000 * positiveInt(
     values["sso-wait-seconds"] ?? process.env.DEVSPACE_SSO_WAIT_SECONDS,
     180,
@@ -84,6 +85,7 @@ const control = new BrowserControlPlane({
   browserChannel: config.browserChannel,
   profileDir: config.profileDir,
   approveSelector: config.approveSelector,
+  autoApprove: config.autoApprove,
   ssoWaitMs: config.ssoWaitMs,
   watchdogIntervalMs: config.watchdogIntervalMs,
 });
@@ -225,6 +227,14 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error ?? "unknown error");
 }
 
+function envFlag(raw, fallback) {
+  if (raw === undefined || raw === "") return fallback;
+  const value = String(raw).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  fail(`expected boolean flag, got ${raw}`);
+}
+
 function positiveInt(raw, fallback) {
   if (raw === undefined) return fallback;
   const value = Number(raw);
@@ -257,6 +267,7 @@ Common options:
   --browser NAME           chrome (default) or msedge
   --profile-dir PATH       Persistent browser profile directory
   --approve-selector CSS   Optional exact SSO approve button selector
+                           (otherwise safe text-based auto-approval is enabled)
   --sso-wait-seconds N     Wait per SSO recovery attempt; default: 180
   --browser-watchdog-seconds N
                            Detect/relaunch a closed browser; default: 15

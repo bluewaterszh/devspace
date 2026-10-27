@@ -109,28 +109,39 @@ class TunnelRelayState {
     this.enqueue(req, res, "session_termination");
   }
 
-  async poll(limit: number, waitMs: number): Promise<TunnelCommand[]> {
+  async poll(limit: number, waitMs: number, res: Response): Promise<void> {
     this.lastPollAt = new Date().toISOString();
-    const ready = this.take(limit);
-    if (ready.length > 0 || waitMs === 0 || this.closed) return ready;
+    if (res.destroyed || res.writableEnded) return;
 
-    await new Promise<void>((resolve) => {
-      const waiter: PollWaiter = {
-        wake: () => {
+    if (this.commands.length === 0 && waitMs > 0 && !this.closed) {
+      await new Promise<void>((resolve) => {
+        const finish = () => {
           clearTimeout(waiter.timer);
           this.pollWaiters.delete(waiter);
+          res.off("close", finish);
           resolve();
-        },
-        timer: setTimeout(() => {
-          this.pollWaiters.delete(waiter);
-          resolve();
-        }, waitMs),
-      };
-      waiter.timer.unref?.();
-      this.pollWaiters.add(waiter);
-    });
+        };
+        const waiter: PollWaiter = {
+          wake: finish,
+          timer: setTimeout(finish, waitMs),
+        };
+        waiter.timer.unref?.();
+        this.pollWaiters.add(waiter);
+        // A disconnected client must stop waiting immediately, rather than
+        // waking later and consuming a command that it can no longer receive.
+        res.once("close", finish);
+      });
+    }
 
-    return this.take(limit);
+    // Check the response after waiting, then dequeue and send without another
+    // await between them. Closed polls must leave work for the next live poll.
+    if (res.destroyed || res.writableEnded) return;
+    const commands = this.take(limit);
+    if (commands.length === 0) {
+      res.status(204).end();
+      return;
+    }
+    res.json({ commands });
   }
 
   acceptResponse(
@@ -414,17 +425,11 @@ export function createRelayApplications(
     if (!tunnel) return;
 
     const state = stateBySlug.get(tunnel.slug)!;
-    const commands = await state.poll(
+    await state.poll(
       parsePollLimit(req.query.limit),
       parsePollWait(req.query.timeout_ms, config.relay.maxPollWaitMs),
+      res,
     );
-
-    if (commands.length === 0) {
-      res.status(204).end();
-      return;
-    }
-
-    res.json({ commands });
   });
 
   tunnelApp.post("/v1/tunnels/:tunnelId/response", (req, res) => {

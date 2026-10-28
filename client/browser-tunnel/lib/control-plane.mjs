@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright-core";
+import { TunnelDiagnostics } from "./diagnostics.mjs";
 
 const CLIENT_NAME = "devspace-browser-tunnel";
 const CLIENT_VERSION = "0.1.0";
@@ -30,10 +31,18 @@ export class BrowserControlPlane {
     this.watchdogTimer = undefined;
     this.stopping = false;
     this.lastSsoCandidateLogAt = 0;
+    this.diagnostics = new TunnelDiagnostics({
+      enabled: options.diagnosticsEnabled ?? true,
+      runtime: () => ({
+        ...options.diagnosticsRuntime?.(),
+        browserReady: this.isBrowserTransportReady(),
+      }),
+    });
   }
 
   async start() {
     this.stopping = false;
+    this.diagnostics.start();
     await this.launchBrowserContext();
     this.startWatchdog();
     await this.openSsoPage();
@@ -65,11 +74,13 @@ export class BrowserControlPlane {
     this.cdp = await this.context.newCDPSession(this.page);
     await this.cdp.send("Page.enable");
     this.bindBrowserLifecycle(this.context, this.page);
+    this.diagnostics.attachNetwork(this.cdp, this.baseUrl, this.tunnelId);
   }
 
   bindBrowserLifecycle(context, page) {
     context.once("close", () => {
       if (this.context !== context) return;
+      this.diagnostics.detachNetwork();
       this.context = undefined;
       this.page = undefined;
       this.cdp = undefined;
@@ -81,6 +92,7 @@ export class BrowserControlPlane {
 
     page.once("close", () => {
       if (this.page !== page) return;
+      this.diagnostics.detachNetwork();
       this.page = undefined;
       this.cdp = undefined;
       if (!this.stopping) {
@@ -134,6 +146,7 @@ export class BrowserControlPlane {
     console.warn(`restarting browser transport: ${reason}`);
 
     const oldContext = this.context;
+    this.diagnostics.detachNetwork();
     this.context = undefined;
     this.page = undefined;
     this.cdp = undefined;
@@ -153,6 +166,7 @@ export class BrowserControlPlane {
         await this.launchBrowserContext();
         if (this.stopping) {
           const stoppingContext = this.context;
+          this.diagnostics.detachNetwork();
           this.context = undefined;
           this.page = undefined;
           this.cdp = undefined;
@@ -166,6 +180,7 @@ export class BrowserControlPlane {
       } catch (error) {
         lastError = error;
         const failedContext = this.context;
+        this.diagnostics.detachNetwork();
         this.context = undefined;
         this.page = undefined;
         this.cdp = undefined;
@@ -184,6 +199,7 @@ export class BrowserControlPlane {
 
   async close() {
     this.stopping = true;
+    this.diagnostics.stop();
     if (this.watchdogTimer) {
       clearInterval(this.watchdogTimer);
       this.watchdogTimer = undefined;
@@ -460,6 +476,10 @@ export class BrowserControlPlane {
       ...(init.headers ?? {}),
     };
 
+    const route = path.split("?")[0];
+    const kind = route.endsWith("/poll") ? "poll"
+      : route.endsWith("/response") ? "response" : "metadata";
+    const operation = this.diagnostics.begin(kind);
     let result;
     try {
       result = await this.evaluateIsolatedFetch({
@@ -467,7 +487,7 @@ export class BrowserControlPlane {
         method: init.method ?? "GET",
         headers,
         body: init.body ?? null,
-      });
+      }, operation);
     } catch (error) {
       result = {
         networkError: String(error),
@@ -479,13 +499,16 @@ export class BrowserControlPlane {
       };
     }
 
+    this.diagnostics.end(operation, result ?? { status: 0, networkError: true });
     result.json = parseJson(result.text);
     return result;
   }
 
-  async evaluateIsolatedFetch(args) {
+  async evaluateIsolatedFetch(args, operation) {
+    this.diagnostics.stage(operation, "get_frame_tree");
     const frameTree = await this.cdp.send("Page.getFrameTree");
     const frameId = frameTree.frameTree.frame.id;
+    this.diagnostics.stage(operation, "create_world");
     const world = await this.cdp.send("Page.createIsolatedWorld", {
       frameId,
       worldName: ISOLATED_WORLD_NAME,
@@ -525,6 +548,7 @@ export class BrowserControlPlane {
       }
     })()`;
 
+    this.diagnostics.stage(operation, "evaluate");
     const evaluated = await this.cdp.send("Runtime.evaluate", {
       expression,
       contextId: world.executionContextId,

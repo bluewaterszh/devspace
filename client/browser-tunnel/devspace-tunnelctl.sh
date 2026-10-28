@@ -95,6 +95,17 @@ cleanup_stale_pid() {
     fi
 }
 
+rotate_log() {
+    local file="$1"
+    [[ -s "$file" ]] || return 0
+
+    # Keep one previous run so a restart does not erase the failure evidence.
+    if [[ -d "$file.previous" ]] || ! mv -f -- "$file" "$file.previous"; then
+        echo "ERROR: could not preserve log: $file" >&2
+        return 1
+    fi
+}
+
 check_config() {
     local missing=0
 
@@ -189,6 +200,7 @@ start_ssh_mcp() {
     fi
 
     build_ssh_args
+    rotate_log "$SSH_LOG" || return 1
 
     echo "Starting ssh-mcp [$PROFILE] ..."
     nohup ssh-mcp "${SSH_ARGS[@]}" > "$SSH_LOG" 2>&1 &
@@ -216,7 +228,7 @@ start_browser_tunnel() {
         return 1
     fi
 
-    : > "$TUNNEL_LOG"
+    rotate_log "$TUNNEL_LOG" || return 1
 
     echo "Starting browser-tunnel [$PROFILE] ..."
     echo "Control plane: $DEVSPACE_CONTROL_PLANE"

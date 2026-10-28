@@ -149,6 +149,50 @@ DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
 During SSO recovery the client retries the selector/text match periodically, so
 an action that appears after a redirect or delayed page load is not missed.
 
+## Diagnosing a stalled tunnel
+
+The CLI prefixes every log line with an ISO 8601 UTC timestamp (`Z`).
+Passive transport diagnostics are enabled by default. They do not change
+request deadlines, retry behavior, or browser recovery.
+
+Look for `TUNNEL_DIAG` records:
+
+- `request_start` / `request_end`: a local `op` number, request kind
+  (`poll`, `metadata`, or `response`), status, and elapsed time.
+- `heartbeat` every 30 seconds: main-loop state, active workers, pending
+  operations and their current stage (`get_frame_tree`, `create_world`,
+  or `evaluate`), time since the last poll returned, and the latest network
+  event. `tick_gap_ms` much larger than 30000 means Node's timer was delayed;
+  it does not by itself distinguish process starvation from machine sleep.
+- `network_request`, `network_response`, `network_finished`, and
+  `network_failed`: Chrome's network events for this tunnel only.
+  Response records include HTTP status, protocol, a local connection number,
+  and whether Chrome reused the connection. Network errors retain only
+  `net::ERR_*` codes. Redirects record status without the destination URL.
+
+If heartbeats continue with `phase=evaluate` but no network response, inspect
+the browser/network path. If Chrome reports a response and download completion
+while the same poll operation remains pending, inspect the renderer/CDP
+completion path. A server access-log completion alone does not prove that the
+browser received the response. If `network_observer` is not `on`, missing
+network events cannot be used as evidence of a network stall.
+
+`op`, `net`, and `connection` are separate local counters, not server IDs.
+Do not assume an exact pairing between concurrently posted responses based
+only on their order. New diagnostic records omit URLs, headers, payloads,
+tokens, and original request/session IDs. Existing error/SSO messages still
+need review before sharing a complete log.
+
+Set `DEVSPACE_TUNNEL_DIAGNOSTICS=0` in the instance env file to disable
+transport diagnostics; timestamp prefixes remain enabled.
+
+On restart, the launcher retains one nonempty previous log for each process:
+`.<profile>.browser-tunnel.log.previous` and
+`.<profile>.ssh-mcp.log.previous`. Preserve these along with the current
+logs when reporting a fault; a later restart can replace the previous copy.
+These are plain JavaScript client changes: update this directory and restart
+the Windows client to activate them. No relay rebuild/restart is required.
+
 ## Security design
 
 The tunnel bearer token is not exposed to the page's normal JavaScript.

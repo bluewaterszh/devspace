@@ -8,6 +8,9 @@ import {
   isControlPlaneResponse,
 } from "../lib/control-plane.mjs";
 import { processTunnelCommand } from "../lib/mcp-forwarder.mjs";
+import { installTimestampedConsole } from "../lib/diagnostics.mjs";
+
+installTimestampedConsole();
 
 const { values } = parseArgs({
   options: {
@@ -78,6 +81,10 @@ const config = {
 if (!config.tunnelId) fail("missing --tunnel-id or TUNNEL_ID");
 if (!config.token) fail("missing DEVSPACE_TUNNEL_TOKEN/CONTROL_PLANE_API_KEY");
 
+let stopping = false;
+let loopPhase = "startup";
+const active = new Set();
+
 const control = new BrowserControlPlane({
   baseUrl: config.controlPlane,
   tunnelId: config.tunnelId,
@@ -88,10 +95,9 @@ const control = new BrowserControlPlane({
   autoApprove: config.autoApprove,
   ssoWaitMs: config.ssoWaitMs,
   watchdogIntervalMs: config.watchdogIntervalMs,
+  diagnosticsEnabled: envFlag(process.env.DEVSPACE_TUNNEL_DIAGNOSTICS, true),
+  diagnosticsRuntime: () => ({ loop: loopPhase, activeWorkers: active.size }),
 });
-
-let stopping = false;
-const active = new Set();
 
 const stop = () => {
   stopping = true;
@@ -117,16 +123,19 @@ try {
       console.warn(
         `initial browser/session setup needs recovery: ${errorMessage(error)}`,
       );
+      loopPhase = "recovering";
       await recoverUntilReady("initial browser/session setup");
     }
 
     while (!stopping) {
+      loopPhase = "polling";
       let polled;
 
       try {
         polled = await control.poll(config.pollLimit, config.pollTimeoutMs);
       } catch (error) {
         console.warn(`poll browser fetch failed: ${errorMessage(error)}`);
+        loopPhase = "recovering";
         await recoverUntilReady("poll browser fetch failed");
         continue;
       }
@@ -140,14 +149,18 @@ try {
         || polled.status !== 200
         || !Array.isArray(polled.json?.commands)
       ) {
+        loopPhase = "recovering";
         await recoverUntilReady("poll response requires browser/session recovery", polled);
         continue;
       }
 
+      loopPhase = "dispatching";
       for (const command of polled.json.commands) {
         while (!stopping && active.size >= config.concurrency) {
+          loopPhase = "worker_capacity";
           await Promise.race(active);
         }
+        loopPhase = "dispatching";
         if (stopping) break;
 
         const task = processTunnelCommand(command, {
@@ -193,6 +206,7 @@ try {
     }
   }
 
+  loopPhase = "draining";
   await Promise.allSettled(active);
 } finally {
   await control.close();

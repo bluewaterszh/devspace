@@ -28,6 +28,7 @@ export class BrowserControlPlane {
     this.page = undefined;
     this.cdp = undefined;
     this.recoveryPromise = undefined;
+    this.authorizationRecoveryPromise = undefined;
     this.watchdogTimer = undefined;
     this.stopping = false;
     this.lastSsoCandidateLogAt = 0;
@@ -240,8 +241,26 @@ export class BrowserControlPlane {
     );
   }
 
-  async ensureAuthorized() {
+  assertSsoPage(page) {
+    if (this.stopping || page !== this.page || !this.isBrowserTransportReady()) {
+      throw new Error("browser transport changed while recovering authorization");
+    }
+    if (page.url().startsWith("chrome-error://")) {
+      throw new Error("browser network error page; control-plane navigation must be retried");
+    }
+  }
+
+  assertMetadataTransport(probe) {
+    if (probe && (probe.networkError || probe.status === 0)) {
+      throw new Error("control-plane metadata transport failed; navigation must be retried");
+    }
+  }
+
+  async ensureAuthorized(page = this.page) {
+    this.assertSsoPage(page);
     let probe = await this.probeIfSameOrigin();
+    this.assertSsoPage(page);
+    this.assertMetadataTransport(probe);
     if (probe && isTunnelMetadata(probe, this.tunnelId)) {
       console.log(
         `control plane ready: ${this.baseUrl.origin} tunnel=${this.tunnelId}`,
@@ -254,7 +273,8 @@ export class BrowserControlPlane {
       printProbe(probe);
     }
 
-    await this.page?.bringToFront().catch(() => {});
+    await page.bringToFront().catch(() => {});
+    this.assertSsoPage(page);
 
     console.log(
       "Complete the enterprise SSO/approval in the browser. "
@@ -264,21 +284,23 @@ export class BrowserControlPlane {
     const deadline = Date.now() + this.ssoWaitMs;
     let lastClickAt = 0;
     while (Date.now() < deadline) {
-      if (!this.isBrowserTransportReady()) {
-        throw new Error("browser was closed while waiting for SSO approval");
-      }
+      this.assertSsoPage(page);
 
       if (
         (this.approveSelector || this.autoApprove)
         && Date.now() - lastClickAt >= 2_000
       ) {
         lastClickAt = Date.now();
-        await this.tryApproveSso();
+        await this.tryApproveSso(page);
+        this.assertSsoPage(page);
       }
 
       await sleep(this.ssoProbeIntervalMs);
+      this.assertSsoPage(page);
 
       probe = await this.probeIfSameOrigin();
+      this.assertSsoPage(page);
+      this.assertMetadataTransport(probe);
       if (probe && isTunnelMetadata(probe, this.tunnelId)) {
         console.log("browser SSO accepted; control plane is ready.");
         return;
@@ -291,13 +313,14 @@ export class BrowserControlPlane {
     );
   }
 
-  async tryApproveSso() {
-    if (!this.page || this.page.isClosed()) return false;
+  async tryApproveSso(page = this.page) {
+    this.assertSsoPage(page);
 
     if (this.approveSelector) {
       try {
-        const button = this.page.locator(this.approveSelector).first();
+        const button = page.locator(this.approveSelector).first();
         if (await button.isVisible({ timeout: 500 }).catch(() => false)) {
+          this.assertSsoPage(page);
           console.log(`auto-clicking SSO selector: ${this.approveSelector}`);
           await button.click({ timeout: 5_000 });
           return true;
@@ -311,9 +334,11 @@ export class BrowserControlPlane {
 
     if (!this.autoApprove) return false;
 
-    const candidates = await this.collectSsoActionCandidates();
+    this.assertSsoPage(page);
+    const candidates = await this.collectSsoActionCandidates(page);
+    this.assertSsoPage(page);
     const action = selectSsoAction(candidates, {
-      allowSingleFallback: !sameOrigin(this.page.url(), this.baseUrl.origin),
+      allowSingleFallback: !sameOrigin(page.url(), this.baseUrl.origin),
     });
 
     if (!action) {
@@ -337,7 +362,7 @@ export class BrowserControlPlane {
     }
   }
 
-  async collectSsoActionCandidates() {
+  async collectSsoActionCandidates(page = this.page) {
     const selector = [
       "button",
       'input[type="submit"]',
@@ -347,7 +372,7 @@ export class BrowserControlPlane {
     ].join(",");
 
     const candidates = [];
-    for (const frame of this.page.frames()) {
+    for (const frame of page.frames()) {
       const controls = frame.locator(selector);
       const count = Math.min(await controls.count().catch(() => 0), 30);
 
@@ -403,29 +428,55 @@ export class BrowserControlPlane {
   }
 
   async recover(reason = "control-plane recovery", result) {
+    if (this.authorizationRecoveryPromise) return this.authorizationRecoveryPromise;
+
+    // Browser replacement has its own promise: authorization recovery may join
+    // it, but restarting a browser must never wait on this same operation.
+    this.authorizationRecoveryPromise = this.doRecover(reason, result)
+      .finally(() => {
+        this.authorizationRecoveryPromise = undefined;
+      });
+    return this.authorizationRecoveryPromise;
+  }
+
+  async doRecover(reason, result) {
     console.warn(`control-plane recovery requested: ${reason}`);
     if (result) printProbe(result);
 
+    if (this.recoveryPromise) return this.recoveryPromise;
     if (!this.isBrowserTransportReady()) {
       await this.restartBrowser(reason);
       return;
     }
 
-    await this.openSsoPage();
-    await this.ensureAuthorized();
+    const page = this.page;
+    try {
+      await this.openSsoPage(page);
+      this.assertSsoPage(page);
+      await this.ensureAuthorized(page);
+    } catch (error) {
+      // A close event/watchdog can replace the browser during a navigation or
+      // SSO probe. Join that replacement instead of touching its new page.
+      if (page !== this.page && this.recoveryPromise) {
+        await this.recoveryPromise;
+        return;
+      }
+      throw error;
+    }
   }
 
   async recoverSso(result) {
     await this.recover("control-plane authentication expired", result);
   }
 
-  async openSsoPage() {
-    if (!this.isBrowserTransportReady()) {
+  async openSsoPage(page = this.page) {
+    // A Chrome error page is allowed here because this navigation repairs it.
+    if (this.stopping || page !== this.page || !this.isBrowserTransportReady()) {
       throw new Error("browser transport is unavailable");
     }
 
     try {
-      await this.page.goto(this.baseUrl.origin + "/", {
+      await page.goto(this.baseUrl.origin + "/", {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
@@ -433,7 +484,13 @@ export class BrowserControlPlane {
       console.warn(
         `SSO page navigation did not finish: ${error instanceof Error ? error.message : error}`,
       );
+      // ERR_ABORTED can be an ordinary SSO redirect; other Chrome network
+      // failures must return to the retry loop instead of waiting for approval.
+      if (/net::ERR_(?!ABORTED\b)/.test(errorMessage(error))) {
+        throw new Error("SSO page network navigation failed; navigation must be retried", { cause: error });
+      }
     }
+    this.assertSsoPage(page);
   }
 
   async probeIfSameOrigin() {
@@ -506,10 +563,11 @@ export class BrowserControlPlane {
 
   async evaluateIsolatedFetch(args, operation) {
     this.diagnostics.stage(operation, "get_frame_tree");
-    const frameTree = await this.cdp.send("Page.getFrameTree");
+    const cdp = this.cdp;
+    const frameTree = await cdp.send("Page.getFrameTree");
     const frameId = frameTree.frameTree.frame.id;
     this.diagnostics.stage(operation, "create_world");
-    const world = await this.cdp.send("Page.createIsolatedWorld", {
+    const world = await cdp.send("Page.createIsolatedWorld", {
       frameId,
       worldName: ISOLATED_WORLD_NAME,
       grantUniveralAccess: false,
@@ -549,7 +607,7 @@ export class BrowserControlPlane {
     })()`;
 
     this.diagnostics.stage(operation, "evaluate");
-    const evaluated = await this.cdp.send("Runtime.evaluate", {
+    const evaluated = await cdp.send("Runtime.evaluate", {
       expression,
       contextId: world.executionContextId,
       awaitPromise: true,

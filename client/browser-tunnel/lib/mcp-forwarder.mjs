@@ -1,4 +1,5 @@
 import { parseSseJson } from "./sse.mjs";
+import { RequestNotPendingError, ResponseDeliveryError } from "./response-delivery.mjs";
 
 const RESPONSE_HEADER_ALLOWLIST = [
   "content-type",
@@ -9,7 +10,27 @@ const RESPONSE_HEADER_ALLOWLIST = [
   "www-authenticate",
 ];
 
-export async function processTunnelCommand(
+export async function processTunnelCommand(command, options) {
+  const deliver = async (...args) => {
+    try {
+      return await options.deliver(...args);
+    } catch (error) {
+      if (error instanceof ResponseDeliveryError) throw error;
+      throw new ResponseDeliveryError("Response delivery failed", { cause: error });
+    }
+  };
+
+  try {
+    await executeTunnelCommand(command, { ...options, deliver });
+  } catch (error) {
+    if (!(error instanceof RequestNotPendingError)) throw error;
+    // Cancellation/timeout at the relay is terminal for this whole command,
+    // including remaining SSE notifications and any fallback error response.
+    console.warn("RESPONSE_NO_LONGER_PENDING: stopped delivery for expired or cancelled request");
+  }
+}
+
+async function executeTunnelCommand(
   command,
   { mcpUrl, mcpAuthorization, deliver, receivedAtMs = Date.now() },
 ) {
@@ -38,6 +59,7 @@ export async function processTunnelCommand(
       deadlineAt,
     });
   } catch (error) {
+    if (error instanceof ResponseDeliveryError) throw error;
     console.error(
       `MCP command failed request_id=${command.request_id}: `
         + (error instanceof Error ? error.message : String(error)),
@@ -168,6 +190,7 @@ async function processSessionTermination(
       resp_type: "session_termination_response",
     });
   } catch (error) {
+    if (error instanceof ResponseDeliveryError) throw error;
     console.error(
       `MCP session termination failed request_id=${command.request_id}: `
         + (error instanceof Error ? error.message : String(error)),

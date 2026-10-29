@@ -8,6 +8,7 @@ import {
   isControlPlaneResponse,
 } from "../lib/control-plane.mjs";
 import { processTunnelCommand } from "../lib/mcp-forwarder.mjs";
+import { createResponseDelivery } from "../lib/response-delivery.mjs";
 import { installTimestampedConsole } from "../lib/diagnostics.mjs";
 
 installTimestampedConsole();
@@ -167,31 +168,7 @@ try {
           mcpUrl: config.mcpUrl,
           mcpAuthorization: config.mcpAuthorization,
           receivedAtMs,
-          deliver: async (sourceCommand, payload) => {
-            let result = await control.postResponse(sourceCommand, payload);
-            if (
-              !isControlPlaneResponse(result)
-              || result.status !== 200
-              || result.json?.status !== "ok"
-            ) {
-              await recoverUntilReady(
-                `response delivery recovery request_id=${sourceCommand.request_id}`,
-                result,
-              );
-              result = await control.postResponse(sourceCommand, payload);
-            }
-
-            if (
-              !isControlPlaneResponse(result)
-              || result.status !== 200
-              || result.json?.status !== "ok"
-            ) {
-              throw new Error(
-                `response delivery failed status=${result.status} `
-                  + `url=${result.url} request_id=${sourceCommand.request_id}`,
-              );
-            }
-          },
+          deliver: createResponseDelivery(control, recoverUntilReady),
         }).catch((error) => {
           console.error(
             `worker failed id=${command.request_id ?? randomUUID()}: `

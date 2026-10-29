@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node bin/devspace-browser-tunnel.mjs",
     "test": "node --test",
-    "check": "node --check bin/devspace-browser-tunnel.mjs && node --check lib/control-plane.mjs && node --check lib/diagnostics.mjs && node --check lib/mcp-forwarder.mjs && node --check lib/sse.mjs"
+    "check": "node --check bin/devspace-browser-tunnel.mjs && node --check lib/control-plane.mjs && node --check lib/diagnostics.mjs && node --check lib/mcp-forwarder.mjs && node --check lib/response-delivery.mjs && node --check lib/sse.mjs"
   },
   "engines": {
     "node": ">=22.16"

@@ -149,6 +149,20 @@ DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
 During SSO recovery the client retries the selector/text match periodically, so
 an action that appears after a redirect or delayed page load is not missed.
 
+## Recovery behavior
+
+Concurrent poll/response failures share one browser navigation and SSO recovery.
+Chrome network error pages and failed metadata fetches return to the retry loop
+instead of spending the SSO approval timeout waiting on a network error page.
+Actual SSO pages still use the configured approval wait and auto-approval.
+
+A response rejected with HTTP 404 and `request_not_found` means the relay no
+longer has that request pending. The client logs `RESPONSE_NO_LONGER_PENDING`
+and stops all remaining responses for that command, including SSE notifications.
+It does not repeat the local MCP operation. Other 404 responses and authentication
+failures still follow the recovery path. Response delivery errors are reported
+separately from failures to reach the local MCP server.
+
 ## Diagnosing a stalled tunnel
 
 The CLI prefixes every log line with an ISO 8601 UTC timestamp (`Z`).

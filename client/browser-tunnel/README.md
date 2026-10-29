@@ -152,8 +152,11 @@ an action that appears after a redirect or delayed page load is not missed.
 ## Recovery behavior
 
 Concurrent poll/response failures share one browser navigation and SSO recovery.
-Chrome network error pages and failed metadata fetches return to the retry loop
-instead of spending the SSO approval timeout waiting on a network error page.
+Chrome network error pages and metadata fetch failures without a recognized
+login action return to the retry loop instead of waiting for SSO approval.
+A healthy login page can also produce a failed API probe during a cross-origin
+SSO redirect. The client allows one explicit login action in that case, or keeps
+the configured manual approval wait when automatic approval is disabled.
 Actual SSO pages still use the configured approval wait and auto-approval.
 
 A response rejected with HTTP 404 and `request_not_found` means the relay no
@@ -162,6 +165,18 @@ and stops all remaining responses for that command, including SSE notifications.
 It does not repeat the local MCP operation. Other 404 responses and authentication
 failures still follow the recovery path. Response delivery errors are reported
 separately from failures to reach the local MCP server.
+
+Control-plane requests have a client-side deadline across all CDP stages and
+the browser fetch, including its response body. Metadata and response delivery
+use 30 seconds; a poll allows its requested server wait plus 15 seconds (45
+seconds with the default poll wait). A timed-out CDP transport is invalidated
+so recovery can replace it; late replies cannot affect a replacement browser.
+
+The local MCP deadline also covers response body reads. Unused notification
+and DELETE response bodies are cancelled. When the runtime delivers SIGINT or
+SIGTERM, the client cancels active local requests and starts browser cleanup
+immediately. Native Windows/Git Bash process signalling still needs verification
+on the target machine.
 
 ## Diagnosing a stalled tunnel
 

@@ -83,6 +83,8 @@ if (!config.tunnelId) fail("missing --tunnel-id or TUNNEL_ID");
 if (!config.token) fail("missing DEVSPACE_TUNNEL_TOKEN/CONTROL_PLANE_API_KEY");
 
 let stopping = false;
+const shutdownController = new AbortController();
+let shutdownPromise;
 let loopPhase = "startup";
 const active = new Set();
 
@@ -100,8 +102,21 @@ const control = new BrowserControlPlane({
   diagnosticsRuntime: () => ({ loop: loopPhase, activeWorkers: active.size }),
 });
 
+function closeControl() {
+  shutdownPromise ??= control.close();
+  return shutdownPromise;
+}
+
 const stop = () => {
+  if (stopping) return;
   stopping = true;
+  shutdownController.abort();
+  // Interrupt the browser poll/SSO now; waiting for the main loop to reach
+  // finally can outlast the launcher's graceful shutdown window.
+  void closeControl().catch((error) => {
+    console.error(`browser shutdown failed: ${errorMessage(error)}`);
+    process.exitCode = 1;
+  });
 };
 process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
@@ -121,11 +136,13 @@ try {
     try {
       await control.start();
     } catch (error) {
-      console.warn(
-        `initial browser/session setup needs recovery: ${errorMessage(error)}`,
-      );
-      loopPhase = "recovering";
-      await recoverUntilReady("initial browser/session setup");
+      if (!stopping) {
+        console.warn(
+          `initial browser/session setup needs recovery: ${errorMessage(error)}`,
+        );
+        loopPhase = "recovering";
+        await recoverUntilReady("initial browser/session setup");
+      }
     }
 
     while (!stopping) {
@@ -135,12 +152,14 @@ try {
       try {
         polled = await control.poll(config.pollLimit, config.pollTimeoutMs);
       } catch (error) {
+        if (stopping) break;
         console.warn(`poll browser fetch failed: ${errorMessage(error)}`);
         loopPhase = "recovering";
         await recoverUntilReady("poll browser fetch failed");
         continue;
       }
 
+      if (stopping) break;
       const receivedAtMs = Date.now();
 
       if (polled.status === 204) continue;
@@ -168,8 +187,10 @@ try {
           mcpUrl: config.mcpUrl,
           mcpAuthorization: config.mcpAuthorization,
           receivedAtMs,
+          signal: shutdownController.signal,
           deliver: createResponseDelivery(control, recoverUntilReady),
         }).catch((error) => {
+          if (stopping) return;
           console.error(
             `worker failed id=${command.request_id ?? randomUUID()}: `
               + (error instanceof Error ? error.stack ?? error.message : error),
@@ -186,7 +207,8 @@ try {
   loopPhase = "draining";
   await Promise.allSettled(active);
 } finally {
-  await control.close();
+  shutdownController.abort();
+  await closeControl();
 }
 
 async function recoverUntilReady(reason, result) {
@@ -199,6 +221,7 @@ async function recoverUntilReady(reason, result) {
       await control.recover(reason, diagnostic);
       return true;
     } catch (error) {
+      if (stopping) return false;
       console.warn(
         `AUTH_RECOVERY_PENDING attempt=${attempt} reason=${reason}: ${errorMessage(error)}`,
       );
@@ -211,7 +234,16 @@ async function recoverUntilReady(reason, result) {
 }
 
 function sleep(ms) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+  if (stopping) return Promise.resolve();
+  return new Promise((resolvePromise) => {
+    const finish = () => {
+      clearTimeout(timer);
+      shutdownController.signal.removeEventListener("abort", finish);
+      resolvePromise();
+    };
+    const timer = setTimeout(finish, ms);
+    shutdownController.signal.addEventListener("abort", finish, { once: true });
+  });
 }
 
 function errorMessage(error) {

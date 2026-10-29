@@ -23,6 +23,13 @@ export class BrowserControlPlane {
     this.watchdogIntervalMs = options.watchdogIntervalMs ?? 15_000;
     this.browserRestartDelayMs = options.browserRestartDelayMs ?? 1_000;
     this.browserRestartAttempts = options.browserRestartAttempts ?? 5;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.pollTimeoutGraceMs = options.pollTimeoutGraceMs ?? 15_000;
+    this.activeRequests = new Set();
+    this.browserLaunchPromise = undefined;
+    this.launchingContext = undefined;
+    this.cancelLaunch = undefined;
+    this.closePromise = undefined;
     this.instanceId = randomBytes(16).toString("hex");
     this.context = undefined;
     this.page = undefined;
@@ -42,40 +49,86 @@ export class BrowserControlPlane {
   }
 
   async start() {
-    this.stopping = false;
+    if (this.stopping) throw new Error("browser control plane is stopping");
     this.diagnostics.start();
     await this.launchBrowserContext();
+    if (this.stopping) {
+      await this.closeBrowserContext();
+      throw new Error("browser control plane is stopping");
+    }
     this.startWatchdog();
-    await this.openSsoPage();
-    await this.ensureAuthorized();
+    const page = this.page;
+    await this.openSsoPage(page);
+    await this.ensureAuthorized(page);
   }
 
   async launchBrowserContext() {
-    const launchOptions = {
+    if (this.browserLaunchPromise) return this.browserLaunchPromise;
+    if (this.stopping) throw new Error("browser control plane is stopping");
+    this.browserLaunchPromise = this.doLaunchBrowserContext()
+      .finally(() => { this.browserLaunchPromise = undefined; });
+    return this.browserLaunchPromise;
+  }
+
+  async doLaunchBrowserContext() {
+    const context = await chromium.launchPersistentContext(this.profileDir, {
       channel: this.browserChannel,
       headless: false,
       viewport: null,
+    });
+    this.launchingContext = context;
+    let active = true;
+    const check = () => {
+      if (!active || this.stopping || this.launchingContext !== context) {
+        throw new Error("browser setup was cancelled or control plane is stopping");
+      }
     };
-    this.context = await chromium.launchPersistentContext(
-      this.profileDir,
-      launchOptions,
-    );
-
-    const pages = this.context.pages();
-    this.page = pages[0] ?? await this.context.newPage();
-
-    // Keep exactly one visible tab. The control-plane fetches execute in a
-    // Chrome isolated world attached to this same page, so the bearer token is
-    // not visible to the page's own JavaScript and no extra transport tab is
-    // needed.
-    for (const extraPage of pages.slice(1)) {
-      await extraPage.close().catch(() => {});
+    const cancelled = new Promise((_, reject) => {
+      this.cancelLaunch = (error) => {
+        if (!active) return;
+        active = false;
+        reject(error);
+      };
+    });
+    const timer = setTimeout(() => {
+      this.cancelLaunch?.(new Error(`Browser setup timed out after ${this.requestTimeoutMs}ms`));
+    }, this.requestTimeoutMs);
+    try {
+      const setup = (async () => {
+        check();
+        const pages = context.pages();
+        const page = pages[0] ?? await context.newPage();
+        check();
+        // Fetches use an isolated world on one dedicated visible tab.
+        for (const extraPage of pages.slice(1)) {
+          await extraPage.close().catch(() => {});
+          check();
+        }
+        const cdp = await context.newCDPSession(page);
+        check();
+        await cdp.send("Page.enable");
+        check();
+        return { page, cdp };
+      })();
+      const { page, cdp } = await Promise.race([setup, cancelled]);
+      check();
+      this.context = context;
+      this.page = page;
+      this.cdp = cdp;
+      this.launchingContext = undefined;
+      this.bindBrowserLifecycle(context, page);
+      this.diagnostics.attachNetwork(cdp, this.baseUrl, this.tunnelId);
+    } catch (error) {
+      if (this.launchingContext === context) {
+        this.launchingContext = undefined;
+        await context.close().catch(() => {});
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      active = false;
+      this.cancelLaunch = undefined;
     }
-
-    this.cdp = await this.context.newCDPSession(this.page);
-    await this.cdp.send("Page.enable");
-    this.bindBrowserLifecycle(this.context, this.page);
-    this.diagnostics.attachNetwork(this.cdp, this.baseUrl, this.tunnelId);
   }
 
   bindBrowserLifecycle(context, page) {
@@ -199,18 +252,55 @@ export class BrowserControlPlane {
   }
 
   async close() {
+    if (this.closePromise) return this.closePromise;
     this.stopping = true;
     this.diagnostics.stop();
     if (this.watchdogTimer) {
       clearInterval(this.watchdogTimer);
       this.watchdogTimer = undefined;
     }
+    this.cancelRequests(undefined, new Error("browser control plane is stopping"));
+    this.cancelLaunch?.(new Error("browser control plane is stopping"));
+    this.closePromise = (async () => {
+      await this.closeBrowserContext();
+      await this.browserLaunchPromise?.catch(() => {});
+      await this.closeBrowserContext();
+    })();
+    return this.closePromise;
+  }
 
-    const context = this.context;
+  async closeBrowserContext() {
+    const contexts = new Set([this.context, this.launchingContext]);
+    this.diagnostics.detachNetwork();
     this.context = undefined;
+    this.launchingContext = undefined;
     this.page = undefined;
     this.cdp = undefined;
-    await context?.close().catch(() => {});
+    await Promise.all([...contexts].map((context) => context?.close().catch(() => {})));
+  }
+
+  cancelRequests(cdp, error) {
+    for (const request of this.activeRequests) {
+      if (!cdp || request.cdp === cdp) request.cancel(error);
+    }
+  }
+
+  expireRequest(request, timeoutMs) {
+    const error = new Error(`Browser control request timed out after ${timeoutMs}ms`);
+    if (this.cdp === request.cdp && this.page === request.page) {
+      this.cdp = undefined;
+      this.diagnostics.detachNetwork();
+      // Detach releases CDP callbacks; never block timeout handling on it.
+      void Promise.resolve().then(() => request.cdp.detach?.()).catch(() => {});
+    }
+    this.cancelRequests(request.cdp, error);
+  }
+
+  assertRequestCurrent(request) {
+    if (!request.active || this.stopping
+      || request.cdp !== this.cdp || request.page !== this.page) {
+      throw new Error("browser control request was cancelled or transport changed");
+    }
   }
 
   async metadata() {
@@ -224,6 +314,8 @@ export class BrowserControlPlane {
       `/v1/tunnels/${encodeURIComponent(this.tunnelId)}/poll`
         + `?limit=${encodeURIComponent(limit)}`
         + `&timeout_ms=${encodeURIComponent(timeoutMs)}`,
+      {},
+      timeoutMs + this.pollTimeoutGraceMs,
     );
   }
 
@@ -260,7 +352,28 @@ export class BrowserControlPlane {
     this.assertSsoPage(page);
     let probe = await this.probeIfSameOrigin();
     this.assertSsoPage(page);
-    this.assertMetadataTransport(probe);
+    let metadataSsoClicked = false;
+    let manualSsoWaiting = false;
+    if (probe && (probe.networkError || probe.status === 0)) {
+      // A protected API redirect can fail CORS while the login page stays
+      // healthy. Try one explicit action, never an arbitrary single button.
+      if (!this.autoApprove && !this.approveSelector) {
+        const candidates = await this.collectSsoActionCandidates(page);
+        this.assertSsoPage(page);
+        manualSsoWaiting = Boolean(selectSsoAction(candidates, { allowSingleFallback: false }));
+      } else {
+        metadataSsoClicked = await this.tryApproveSso(page, { allowSingleFallback: false });
+        this.assertSsoPage(page);
+      }
+      if (!metadataSsoClicked && !manualSsoWaiting) this.assertMetadataTransport(probe);
+      if (metadataSsoClicked) {
+        await sleep(this.ssoProbeIntervalMs);
+        this.assertSsoPage(page);
+        probe = await this.probeIfSameOrigin();
+        this.assertSsoPage(page);
+      }
+    }
+    if (!manualSsoWaiting) this.assertMetadataTransport(probe);
     if (probe && isTunnelMetadata(probe, this.tunnelId)) {
       console.log(
         `control plane ready: ${this.baseUrl.origin} tunnel=${this.tunnelId}`,
@@ -282,7 +395,7 @@ export class BrowserControlPlane {
     );
 
     const deadline = Date.now() + this.ssoWaitMs;
-    let lastClickAt = 0;
+    let lastClickAt = metadataSsoClicked ? Date.now() : 0;
     while (Date.now() < deadline) {
       this.assertSsoPage(page);
 
@@ -300,7 +413,7 @@ export class BrowserControlPlane {
 
       probe = await this.probeIfSameOrigin();
       this.assertSsoPage(page);
-      this.assertMetadataTransport(probe);
+      if (!manualSsoWaiting) this.assertMetadataTransport(probe);
       if (probe && isTunnelMetadata(probe, this.tunnelId)) {
         console.log("browser SSO accepted; control plane is ready.");
         return;
@@ -313,7 +426,7 @@ export class BrowserControlPlane {
     );
   }
 
-  async tryApproveSso(page = this.page) {
+  async tryApproveSso(page = this.page, options = {}) {
     this.assertSsoPage(page);
 
     if (this.approveSelector) {
@@ -338,7 +451,7 @@ export class BrowserControlPlane {
     const candidates = await this.collectSsoActionCandidates(page);
     this.assertSsoPage(page);
     const action = selectSsoAction(candidates, {
-      allowSingleFallback: !sameOrigin(page.url(), this.baseUrl.origin),
+      allowSingleFallback: options.allowSingleFallback ?? !sameOrigin(page.url(), this.baseUrl.origin),
     });
 
     if (!action) {
@@ -503,11 +616,11 @@ export class BrowserControlPlane {
     return this.metadata();
   }
 
-  async request(path, init = {}) {
+  async request(path, init = {}, timeoutMs = this.requestTimeoutMs) {
     const url = new URL(path, this.baseUrl).href;
 
     if (
-      !this.isBrowserTransportReady()
+      this.stopping || !this.isBrowserTransportReady()
       || !sameOrigin(this.page.url(), this.baseUrl.origin)
     ) {
       return {
@@ -537,14 +650,29 @@ export class BrowserControlPlane {
     const kind = route.endsWith("/poll") ? "poll"
       : route.endsWith("/response") ? "response" : "metadata";
     const operation = this.diagnostics.begin(kind);
+    const request = { cdp: this.cdp, page: this.page, active: true };
+    const cancelled = new Promise((_, reject) => {
+      request.cancel = (error) => {
+        if (!request.active) return;
+        request.active = false;
+        reject(error);
+      };
+    });
+    this.activeRequests.add(request);
+    const timer = setTimeout(() => this.expireRequest(request, timeoutMs), timeoutMs);
+    timer.unref?.();
     let result;
     try {
-      result = await this.evaluateIsolatedFetch({
-        url,
-        method: init.method ?? "GET",
-        headers,
-        body: init.body ?? null,
-      }, operation);
+      result = await Promise.race([
+        this.evaluateIsolatedFetch({
+          url,
+          method: init.method ?? "GET",
+          headers,
+          body: init.body ?? null,
+          timeoutMs,
+        }, operation, request),
+        cancelled,
+      ]);
     } catch (error) {
       result = {
         networkError: String(error),
@@ -554,6 +682,10 @@ export class BrowserControlPlane {
         contentType: "",
         text: "",
       };
+    } finally {
+      clearTimeout(timer);
+      request.active = false;
+      this.activeRequests.delete(request);
     }
 
     this.diagnostics.end(operation, result ?? { status: 0, networkError: true });
@@ -561,10 +693,12 @@ export class BrowserControlPlane {
     return result;
   }
 
-  async evaluateIsolatedFetch(args, operation) {
+  async evaluateIsolatedFetch(args, operation, request) {
+    this.assertRequestCurrent(request);
     this.diagnostics.stage(operation, "get_frame_tree");
-    const cdp = this.cdp;
+    const cdp = request.cdp;
     const frameTree = await cdp.send("Page.getFrameTree");
+    this.assertRequestCurrent(request);
     const frameId = frameTree.frameTree.frame.id;
     this.diagnostics.stage(operation, "create_world");
     const world = await cdp.send("Page.createIsolatedWorld", {
@@ -573,9 +707,12 @@ export class BrowserControlPlane {
       grantUniveralAccess: false,
     });
 
+    this.assertRequestCurrent(request);
     const serialized = JSON.stringify(args);
     const expression = `(async () => {
-      const { url, method, headers, body } = ${serialized};
+      const { url, method, headers, body, timeoutMs } = ${serialized};
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), timeoutMs);
       try {
         const response = await fetch(url, {
           method,
@@ -584,6 +721,7 @@ export class BrowserControlPlane {
           credentials: "include",
           cache: "no-store",
           redirect: "follow",
+          signal: abort.signal,
         });
         const text = await response.text();
         return {
@@ -603,6 +741,8 @@ export class BrowserControlPlane {
           contentType: "",
           text: "",
         };
+      } finally {
+        clearTimeout(timer);
       }
     })()`;
 
@@ -614,6 +754,7 @@ export class BrowserControlPlane {
       returnByValue: true,
     });
 
+    this.assertRequestCurrent(request);
     if (evaluated.exceptionDetails) {
       throw new Error(
         evaluated.exceptionDetails.exception?.description

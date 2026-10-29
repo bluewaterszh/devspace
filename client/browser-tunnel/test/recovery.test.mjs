@@ -178,7 +178,7 @@ test("metadata network errors and status zero do not enter SSO approval waiting"
     await t.test(JSON.stringify(result), async () => {
       const { control } = fixture();
       control.metadata = async () => result;
-      control.tryApproveSso = async () => assert.fail("transport error treated as SSO");
+      control.tryApproveSso = async () => false;
       await assert.rejects(control.ensureAuthorized(), /metadata transport failed/);
     });
   }
@@ -223,7 +223,7 @@ test("navigation network failures leave the attempt even if Chrome retains the o
   await assert.rejects(control.recover(), /network navigation failed/);
 });
 
-test("a control request keeps its original CDP session across browser replacement", { timeout: 1_000 }, async () => {
+test("a control request stops before using a replaced CDP session", { timeout: 1_000 }, async () => {
   const { control } = fixture();
   const frame = deferred();
   const calls = [];
@@ -239,6 +239,6 @@ test("a control request keeps its original CDP session across browser replacemen
   await tick();
   control.cdp = { async send() { assert.fail("old request used new browser CDP session"); } };
   frame.resolve({ frameTree: { frame: { id: "test-frame" } } });
-  assert.equal((await request).status, 204);
-  assert.deepEqual(calls, ["Page.getFrameTree", "Page.createIsolatedWorld", "Runtime.evaluate"]);
+  assert.equal((await request).status, 0);
+  assert.deepEqual(calls, ["Page.getFrameTree"]);
 });

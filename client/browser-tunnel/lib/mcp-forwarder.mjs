@@ -11,8 +11,10 @@ const RESPONSE_HEADER_ALLOWLIST = [
 ];
 
 export async function processTunnelCommand(command, options) {
+  if (options.signal?.aborted) return;
   const deliver = async (...args) => {
     try {
+      options.signal?.throwIfAborted();
       return await options.deliver(...args);
     } catch (error) {
       if (error instanceof ResponseDeliveryError) throw error;
@@ -23,6 +25,7 @@ export async function processTunnelCommand(command, options) {
   try {
     await executeTunnelCommand(command, { ...options, deliver });
   } catch (error) {
+    if (options.signal?.aborted) return;
     if (!(error instanceof RequestNotPendingError)) throw error;
     // Cancellation/timeout at the relay is terminal for this whole command,
     // including remaining SSE notifications and any fallback error response.
@@ -32,7 +35,7 @@ export async function processTunnelCommand(command, options) {
 
 async function executeTunnelCommand(
   command,
-  { mcpUrl, mcpAuthorization, deliver, receivedAtMs = Date.now() },
+  { mcpUrl, mcpAuthorization, deliver, receivedAtMs = Date.now(), signal },
 ) {
   const deadlineAt = commandDeadline(command, receivedAtMs);
   if (deadlineAt !== undefined && Date.now() >= deadlineAt) return;
@@ -43,6 +46,7 @@ async function executeTunnelCommand(
       mcpAuthorization,
       deliver,
       deadlineAt,
+      signal,
     });
     return;
   }
@@ -57,9 +61,10 @@ async function executeTunnelCommand(
       mcpAuthorization,
       deliver,
       deadlineAt,
+      signal,
     });
   } catch (error) {
-    if (error instanceof ResponseDeliveryError) throw error;
+    if (signal?.aborted || error instanceof ResponseDeliveryError) throw error;
     console.error(
       `MCP command failed request_id=${command.request_id}: `
         + (error instanceof Error ? error.message : String(error)),
@@ -70,14 +75,14 @@ async function executeTunnelCommand(
 
 async function processJsonRpc(
   command,
-  { mcpUrl, mcpAuthorization, deliver, deadlineAt },
+  { mcpUrl, mcpAuthorization, deliver, deadlineAt, signal },
 ) {
   const payload = command.jsonrpc;
   const hasId = payload
     && typeof payload === "object"
     && Object.prototype.hasOwnProperty.call(payload, "id");
 
-  const response = await fetchWithDeadline(
+  const { response, body } = await fetchLocalResponse(
     mcpUrl,
     {
       method: "POST",
@@ -86,6 +91,8 @@ async function processJsonRpc(
       redirect: "manual",
     },
     deadlineAt,
+    signal,
+    hasId,
   );
 
   const responseHeaders = selectedResponseHeaders(response);
@@ -103,7 +110,6 @@ async function processJsonRpc(
     return;
   }
 
-  const body = await response.text();
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 
   if (contentType.includes("text/event-stream")) {
@@ -169,10 +175,10 @@ async function processJsonRpc(
 
 async function processSessionTermination(
   command,
-  { mcpUrl, mcpAuthorization, deliver, deadlineAt },
+  { mcpUrl, mcpAuthorization, deliver, deadlineAt, signal },
 ) {
   try {
-    const response = await fetchWithDeadline(
+    const { response } = await fetchLocalResponse(
       mcpUrl,
       {
         method: "DELETE",
@@ -180,6 +186,8 @@ async function processSessionTermination(
         redirect: "manual",
       },
       deadlineAt,
+      signal,
+      false,
     );
 
     await deliver(command, {
@@ -190,7 +198,7 @@ async function processSessionTermination(
       resp_type: "session_termination_response",
     });
   } catch (error) {
-    if (error instanceof ResponseDeliveryError) throw error;
+    if (signal?.aborted || error instanceof ResponseDeliveryError) throw error;
     console.error(
       `MCP session termination failed request_id=${command.request_id}: `
         + (error instanceof Error ? error.message : String(error)),
@@ -276,19 +284,33 @@ function canonicalHeaderName(name) {
     .join("-");
 }
 
-async function fetchWithDeadline(url, init, deadlineAt) {
-  if (deadlineAt === undefined) return fetch(url, init);
-
-  const remainingMs = deadlineAt - Date.now();
-  if (remainingMs <= 0) throw new Error("command deadline already expired");
+async function fetchLocalResponse(url, init, deadlineAt, signal, readBody) {
+  signal?.throwIfAborted();
+  const remainingMs = deadlineAt === undefined ? undefined : deadlineAt - Date.now();
+  if (remainingMs !== undefined && remainingMs <= 0) {
+    throw new Error("command deadline already expired");
+  }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), remainingMs);
-  timer.unref?.();
+  const abort = () => controller.abort(signal.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = remainingMs === undefined
+    ? undefined
+    : setTimeout(() => controller.abort(), remainingMs);
+  timer?.unref?.();
+  let response;
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    response = await fetch(url, { ...init, signal: controller.signal });
+    // Fetch resolves at headers. Keep the deadline active until the body has
+    // finished too, otherwise a stalled JSON/SSE body can occupy a worker forever.
+    const body = readBody ? await response.text() : undefined;
+    return { response, body };
   } finally {
+    // Notifications and DELETE acknowledgements do not use a response body.
+    // Release it before delivery, including when it never reaches EOF.
+    await response?.body?.cancel().catch(() => {});
     clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
 }
 

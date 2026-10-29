@@ -22,6 +22,11 @@ Configuration is stored in `~/.devspace/config.jsonc`; secrets are in `~/.devspa
 
 See [docs/ssh-tunnel-relay.md](docs/ssh-tunnel-relay.md) for details.
 
+Queued commands are removed when the caller disconnects or the response deadline
+expires. Polling also checks the deadline before dispatch, even if a timeout
+callback has been delayed. Commands already dispatched can still race with caller
+cancellation or timeout; their late responses receive `request_not_found`.
+
 ## Development
 
 ```bash

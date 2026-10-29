@@ -77,6 +77,8 @@ interface PendingRequest {
   acceptsSse: boolean;
   sseStarted: boolean;
   timer: NodeJS.Timeout;
+  deadlineAt: number;
+  rpcId: unknown;
 }
 
 interface PollWaiter {
@@ -85,7 +87,7 @@ interface PollWaiter {
 }
 
 class TunnelRelayState {
-  private readonly commands: TunnelCommand[] = [];
+  private readonly commands = new Map<string, TunnelCommand>();
   private readonly pending = new Map<string, PendingRequest>();
   private readonly pollWaiters = new Set<PollWaiter>();
   private closed = false;
@@ -95,7 +97,7 @@ class TunnelRelayState {
 
   snapshot(): { queued: number; pending: number; lastPollAt?: string } {
     return {
-      queued: this.commands.length,
+      queued: this.commands.size,
       pending: this.pending.size,
       lastPollAt: this.lastPollAt,
     };
@@ -113,7 +115,7 @@ class TunnelRelayState {
     this.lastPollAt = new Date().toISOString();
     if (res.destroyed || res.writableEnded) return;
 
-    if (this.commands.length === 0 && waitMs > 0 && !this.closed) {
+    if (this.commands.size === 0 && waitMs > 0 && !this.closed) {
       await new Promise<void>((resolve) => {
         const finish = () => {
           clearTimeout(waiter.timer);
@@ -152,6 +154,14 @@ class TunnelRelayState {
     const pending = this.pending.get(payload.request_id);
     if (!pending) return "not_found";
     if (!shardToken || !safeEquals(shardToken, pending.shardToken)) return "invalid_shard";
+    if (pending.response.destroyed || pending.response.writableEnded) {
+      this.finishPending(pending.requestId);
+      return "not_found";
+    }
+    if (performance.now() >= pending.deadlineAt) {
+      this.expirePending(pending.requestId);
+      return "not_found";
+    }
 
     const responseType = typeof payload.resp_type === "string"
       ? payload.resp_type
@@ -178,8 +188,7 @@ class TunnelRelayState {
       return "invalid_payload";
     }
 
-    clearTimeout(pending.timer);
-    this.pending.delete(pending.requestId);
+    this.finishPending(pending.requestId);
     const status = normalizeStatus(payload.resp_code);
 
     if (pending.acceptsSse && payload.resp_json !== undefined) {
@@ -220,7 +229,7 @@ class TunnelRelayState {
     }
 
     this.pending.clear();
-    this.commands.length = 0;
+    this.commands.clear();
   }
 
   private enqueue(
@@ -233,6 +242,8 @@ class TunnelRelayState {
       res.status(503).json({ error: "relay is shutting down" });
       return;
     }
+
+    if (res.destroyed || res.writableEnded) return;
 
     const requestId = `req_${randomUUID()}`;
     const shardToken = randomBytes(24).toString("base64url");
@@ -249,21 +260,8 @@ class TunnelRelayState {
       ? { ...base, command_type: "jsonrpc", jsonrpc }
       : { ...base, command_type: "session_termination" };
 
-    const timer = setTimeout(() => {
-      const current = this.pending.get(requestId);
-      if (!current) return;
-      this.pending.delete(requestId);
-
-      if (!current.response.headersSent) {
-        current.response.status(504).json({
-          jsonrpc: "2.0",
-          id: jsonRpcId(jsonrpc),
-          error: { code: -32603, message: "Tunnel response timed out" },
-        });
-      } else {
-        current.response.end();
-      }
-    }, this.responseTimeoutMs);
+    const deadlineAt = performance.now() + this.responseTimeoutMs;
+    const timer = setTimeout(() => this.expirePending(requestId), this.responseTimeoutMs);
     timer.unref?.();
 
     this.pending.set(requestId, {
@@ -273,21 +271,58 @@ class TunnelRelayState {
       acceptsSse: req.accepts("text/event-stream") === "text/event-stream",
       sseStarted: false,
       timer,
+      deadlineAt,
+      rpcId: jsonRpcId(jsonrpc),
     });
-    this.commands.push(command);
+    this.commands.set(requestId, command);
     this.wakePollers();
 
     res.once("close", () => {
-      if (res.writableEnded) return;
-      const current = this.pending.get(requestId);
-      if (!current) return;
-      clearTimeout(current.timer);
-      this.pending.delete(requestId);
+      this.finishPending(requestId);
     });
   }
 
+  private finishPending(requestId: string): PendingRequest | undefined {
+    const pending = this.pending.get(requestId);
+    if (pending) clearTimeout(pending.timer);
+    this.pending.delete(requestId);
+    this.commands.delete(requestId);
+    return pending;
+  }
+
+  private expirePending(requestId: string): void {
+    const pending = this.finishPending(requestId);
+    if (!pending || pending.response.destroyed || pending.response.writableEnded) return;
+    if (!pending.response.headersSent) {
+      pending.response.status(504).json({
+        jsonrpc: "2.0",
+        id: pending.rpcId,
+        error: { code: -32603, message: "Tunnel response timed out" },
+      });
+    } else {
+      pending.response.end();
+    }
+  }
+
   private take(limit: number): TunnelCommand[] {
-    return this.commands.splice(0, limit);
+    const commands: TunnelCommand[] = [];
+    for (const command of this.commands.values()) {
+      const pending = this.pending.get(command.request_id);
+      if (!pending || pending.response.destroyed || pending.response.writableEnded) {
+        this.finishPending(command.request_id);
+        continue;
+      }
+      // Check the deadline as well as the timer: a busy event loop can delay
+      // the timeout/close callback until after this poll becomes runnable.
+      if (performance.now() >= pending.deadlineAt) {
+        this.expirePending(command.request_id);
+        continue;
+      }
+      this.commands.delete(command.request_id);
+      commands.push(command);
+      if (commands.length === limit) break;
+    }
+    return commands;
   }
 
   private wakePollers(): void {

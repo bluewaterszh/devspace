@@ -172,7 +172,13 @@ use 30 seconds; a poll allows its requested server wait plus 15 seconds (45
 seconds with the default poll wait). A timed-out CDP transport is invalidated
 so recovery can replace it; late replies cannot affect a replacement browser.
 
-The local MCP deadline also covers response body reads. Unused notification
+Local MCP SSE events are decoded incrementally and progress is forwarded as it
+arrives. A matching final result or error ends the local stream immediately,
+without waiting for the server to close it. Expired requests and failed delivery
+also close the stream, including when a later event is already buffered.
+
+The local MCP deadline also covers response body reads and is checked after
+progress delivery before processing the next event. Unused notification
 and DELETE response bodies are cancelled. When the runtime delivers SIGINT or
 SIGTERM, the client cancels active local requests and starts browser cleanup
 immediately. Native Windows/Git Bash process signalling still needs verification

@@ -72,8 +72,10 @@ for (const bodyType of ["JSON", "SSE"]) {
       const socketClosed = reached.promise;
       await within(running);
       await within(socketClosed);
-      assert.equal(delivered.length, 1);
-      assert.equal(delivered[0].resp_code, 502);
+      assert.deepEqual(delivered.map((item) => item.resp_type), bodyType === "SSE"
+        ? ["jsonrpc_notify", "jsonrpc_response"] : ["jsonrpc_response"]);
+      assert.deepEqual(delivered.map((item) => item.resp_code), bodyType === "SSE"
+        ? [200, 502] : [502]);
     });
   });
 }
@@ -169,7 +171,7 @@ test("deadline failure followed by terminal relay rejection stops without anothe
   t.mock.method(console, "warn", () => {});
   await withServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.write('data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n');
+    res.write('data: {"jsonrpc":"2.0","method":');
   }, async (mcpUrl) => {
     let deliveries = 0;
     await within(processTunnelCommand(command(), {

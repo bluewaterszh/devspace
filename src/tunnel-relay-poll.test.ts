@@ -16,7 +16,7 @@ interface Command {
   jsonrpc: { id: number; method: string };
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, responseTimeoutMs = 5000) {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-poll-test-"));
   const listener = {
     host: "127.0.0.1",
@@ -40,7 +40,7 @@ async function fixture(t: TestContext) {
     },
     relay: {
       tunnelToken: "poll-test-tunnel-token",
-      responseTimeoutMs: 5000,
+      responseTimeoutMs,
       maxPollWaitMs: 3000,
     },
   };
@@ -104,9 +104,10 @@ async function fixture(t: TestContext) {
     request.destroy();
     await closed;
   }
-  function initialize(id: number) {
+  function initialize(id: number, signal?: AbortSignal) {
     return fetch(openai.base + "/mcp/probe", {
       method: "POST",
+      signal,
       headers: {
         authorization: "Bearer " + accessToken,
         "content-type": "application/json",
@@ -124,6 +125,16 @@ async function fixture(t: TestContext) {
       }),
     });
   }
+  function terminate() {
+    return fetch(openai.base + "/mcp/probe", {
+      method: "DELETE",
+      headers: {
+        authorization: "Bearer " + accessToken,
+        "mcp-session-id": "queue-test-session",
+        accept: "application/json",
+      },
+    });
+  }
   async function poll(limit = 25) {
     return fetch(pollUrl(0, limit), { headers });
   }
@@ -131,7 +142,7 @@ async function fixture(t: TestContext) {
     assert.equal(response.status, 200);
     return (await response.json() as { commands: Command[] }).commands;
   }
-  async function respond(command: Command) {
+  async function respond(command: Command, expectedStatus = 200) {
     const response = await fetch(path + "/response", {
       method: "POST",
       headers: {
@@ -146,8 +157,10 @@ async function fixture(t: TestContext) {
         resp_json: { jsonrpc: "2.0", id: command.jsonrpc.id, result: { ok: true } },
       }),
     });
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { status: "ok" });
+    assert.equal(response.status, expectedStatus);
+    const body = await response.json() as { error?: { code?: string } };
+    if (expectedStatus === 200) assert.deepEqual(body, { status: "ok" });
+    else assert.equal(body.error?.code, "request_not_found");
   }
   async function completed(response: Promise<Response>, id: number) {
     const result = await response;
@@ -156,7 +169,7 @@ async function fixture(t: TestContext) {
   }
   return {
     snapshot, waitQueued, pendingPoll, abandonPoll, initialize,
-    poll, commands, respond, completed,
+    poll, commands, respond, completed, terminate,
   };
 }
 
@@ -219,6 +232,105 @@ test("an idle poll times out normally and a later poll still receives work", { t
   await f.respond(commands[0]!);
   await f.completed(response, 6);
   assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+});
+
+test("timed-out queued requests are removed before any poll", { timeout: 10000 }, async (t) => {
+  const f = await fixture(t, 200);
+  const upstream = f.initialize(7);
+  await f.waitQueued(1);
+  const response = await upstream;
+  assert.equal(response.status, 504);
+  assert.equal((await response.json() as { id: number }).id, 7);
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+  assert.equal((await f.poll()).status, 204);
+});
+
+test("caller cancellation removes queued work without a client poll", { timeout: 10000 }, async (t) => {
+  const f = await fixture(t);
+  const abort = new AbortController();
+  const upstream = f.initialize(8, abort.signal).catch(() => undefined);
+  await f.waitQueued(1);
+  abort.abort();
+  await upstream;
+  await f.waitQueued(0);
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+  assert.equal((await f.poll()).status, 204);
+});
+
+test("cancelled queue entries do not change live FIFO order or batch size", { timeout: 10000 }, async (t) => {
+  const f = await fixture(t);
+  const requests = new Map<number, { abort: AbortController; response: Promise<Response | undefined> }>();
+  for (const id of [10, 11, 12, 13]) {
+    const abort = new AbortController();
+    requests.set(id, { abort, response: f.initialize(id, abort.signal).catch(() => undefined) });
+    await f.waitQueued(requests.size);
+  }
+  requests.get(10)!.abort.abort();
+  requests.get(12)!.abort.abort();
+  await Promise.all([requests.get(10)!.response, requests.get(12)!.response]);
+  await f.waitQueued(2);
+  const commands = await f.commands(await f.poll(2));
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), [11, 13]);
+  assert.equal((await f.poll()).status, 204);
+  for (const command of commands) {
+    await f.respond(command);
+    const upstream = await requests.get(command.jsonrpc.id)!.response;
+    assert.equal(upstream?.status, 200);
+    await upstream!.text();
+  }
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+});
+
+test("poll skips an elapsed deadline even before its timer callback runs", { timeout: 10000 }, async (t) => {
+  const f = await fixture(t);
+  let now = performance.now();
+  t.mock.method(performance, "now", () => now);
+  const expired = f.initialize(20);
+  await f.waitQueued(1);
+  now += 1000;
+  const live = f.initialize(21);
+  await f.waitQueued(2);
+  // Advance the deadline clock without firing real timers. This models the
+  // event loop handling a poll before an overdue timeout callback.
+  now += 4500;
+  const commands = await f.commands(await f.poll(1));
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), [21]);
+  const expiredResponse = await expired;
+  assert.equal(expiredResponse.status, 504);
+  await expiredResponse.text();
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 1 });
+  await f.respond(commands[0]!);
+  await f.completed(live, 21);
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+});
+
+test("late and duplicate response delivery remains terminal after dispatch", { timeout: 10000 }, async (t) => {
+  const f = await fixture(t);
+  let now = performance.now();
+  t.mock.method(performance, "now", () => now);
+  const upstream = f.initialize(22);
+  await f.waitQueued(1);
+  const [command] = await f.commands(await f.poll());
+  assert.ok(command);
+  now += 6000;
+  await f.respond(command, 404);
+  const expired = await upstream;
+  assert.equal(expired.status, 504);
+  await expired.text();
+  await f.respond(command, 404);
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+  assert.equal((await f.poll()).status, 204);
+});
+
+test("queued session termination also expires without being dispatched", { timeout: 10000 }, async (t) => {
+  const f = await fixture(t, 200);
+  const upstream = f.terminate();
+  await f.waitQueued(1);
+  const response = await upstream;
+  assert.equal(response.status, 504);
+  assert.equal((await response.json() as { id: unknown }).id, null);
+  assert.deepEqual(await f.snapshot(), { queued: 0, pending: 0 });
+  assert.equal((await f.poll()).status, 204);
 });
 
 async function authorize(base: string, config: ServerConfig): Promise<string> {

@@ -1,4 +1,4 @@
-import { parseSseJson } from "./sse.mjs";
+import { readSseJson } from "./sse.mjs";
 import { RequestNotPendingError, ResponseDeliveryError } from "./response-delivery.mjs";
 
 const RESPONSE_HEADER_ALLOWLIST = [
@@ -82,7 +82,7 @@ async function processJsonRpc(
     && typeof payload === "object"
     && Object.prototype.hasOwnProperty.call(payload, "id");
 
-  const { response, body } = await fetchLocalResponse(
+  await withLocalResponse(
     mcpUrl,
     {
       method: "POST",
@@ -92,85 +92,87 @@ async function processJsonRpc(
     },
     deadlineAt,
     signal,
-    hasId,
-  );
+    async (response, checkActive) => {
+      const responseHeaders = selectedResponseHeaders(response);
 
-  const responseHeaders = selectedResponseHeaders(response);
-
-  if (!hasId) {
-    // JSON-RPC notifications are terminally acknowledged after the downstream
-    // write succeeds. Streamable HTTP MCP servers commonly answer 202 here.
-    await deliver(command, {
-      request_id: command.request_id,
-      channel: command.channel ?? "main",
-      resp_headers: responseHeaders,
-      resp_code: response.status,
-      resp_type: "notify_ack",
-    });
-    return;
-  }
-
-  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-
-  if (contentType.includes("text/event-stream")) {
-    const events = parseSseJson(body);
-    let finalPayload;
-
-    for (const event of events) {
-      if (sameJsonRpcId(event?.id, payload.id)) {
-        finalPayload = event;
-        continue;
-      }
-      if (event && typeof event === "object" && typeof event.method === "string") {
+      if (!hasId) {
+        // Notifications are acknowledged once the downstream write succeeds.
+        await response.body?.cancel().catch(() => {});
+        checkActive();
         await deliver(command, {
           request_id: command.request_id,
           channel: command.channel ?? "main",
-          resp_json: event,
           resp_headers: responseHeaders,
           resp_code: response.status,
-          resp_type: "jsonrpc_notify",
+          resp_type: "notify_ack",
         });
+        return;
       }
-    }
 
-    if (!finalPayload) {
-      throw new Error("MCP SSE stream ended without a final JSON-RPC response");
-    }
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (contentType.includes("text/event-stream")) {
+        const events = readSseJson(response.body);
+        for await (const event of events) {
+          checkActive();
+          const final = event && typeof event === "object"
+            && typeof event.method !== "string"
+            && sameJsonRpcId(event.id, payload.id)
+            && (Object.prototype.hasOwnProperty.call(event, "result")
+              || Object.prototype.hasOwnProperty.call(event, "error"));
+          if (final) {
+            // The response is complete even if the server keeps its SSE open.
+            // Close the reader before a potentially slow control-plane delivery.
+            await events.return();
+            checkActive();
+            await deliver(command, {
+              request_id: command.request_id,
+              channel: command.channel ?? "main",
+              resp_json: event,
+              resp_headers: responseHeaders,
+              resp_code: response.status,
+              resp_type: "jsonrpc_response",
+            });
+            return;
+          }
+          if (event && typeof event === "object" && typeof event.method === "string") {
+            await deliver(command, {
+              request_id: command.request_id,
+              channel: command.channel ?? "main",
+              resp_json: event,
+              resp_headers: responseHeaders,
+              resp_code: response.status,
+              resp_type: "jsonrpc_notify",
+            });
+            // Delivery can take time: do not emit an already-buffered final
+            // response after the local deadline or a shutdown signal.
+            checkActive();
+          }
+        }
+        throw new Error("MCP SSE stream ended without a final JSON-RPC response");
+      }
 
-    await deliver(command, {
-      request_id: command.request_id,
-      channel: command.channel ?? "main",
-      resp_json: finalPayload,
-      resp_headers: responseHeaders,
-      resp_code: response.status,
-      resp_type: "jsonrpc_response",
-    });
-    return;
-  }
-
-  if (!body) {
-    throw new Error(
-      `MCP returned HTTP ${response.status} with an empty response body`,
-    );
-  }
-
-  let json;
-  try {
-    json = JSON.parse(body);
-  } catch {
-    throw new Error(
-      `MCP returned non-JSON content-type=${contentType || "unknown"}`,
-    );
-  }
-
-  await deliver(command, {
-    request_id: command.request_id,
-    channel: command.channel ?? "main",
-    resp_json: json,
-    resp_headers: responseHeaders,
-    resp_code: response.status,
-    resp_type: "jsonrpc_response",
-  });
+      const body = await response.text();
+      checkActive();
+      if (!body) {
+        throw new Error(`MCP returned HTTP ${response.status} with an empty response body`);
+      }
+      let json;
+      try {
+        json = JSON.parse(body);
+      } catch {
+        throw new Error(`MCP returned non-JSON content-type=${contentType || "unknown"}`);
+      }
+      checkActive();
+      await deliver(command, {
+        request_id: command.request_id,
+        channel: command.channel ?? "main",
+        resp_json: json,
+        resp_headers: responseHeaders,
+        resp_code: response.status,
+        resp_type: "jsonrpc_response",
+      });
+    },
+  );
 }
 
 async function processSessionTermination(
@@ -178,7 +180,7 @@ async function processSessionTermination(
   { mcpUrl, mcpAuthorization, deliver, deadlineAt, signal },
 ) {
   try {
-    const { response } = await fetchLocalResponse(
+    await withLocalResponse(
       mcpUrl,
       {
         method: "DELETE",
@@ -187,16 +189,18 @@ async function processSessionTermination(
       },
       deadlineAt,
       signal,
-      false,
+      async (response, checkActive) => {
+        await response.body?.cancel().catch(() => {});
+        checkActive();
+        await deliver(command, {
+          request_id: command.request_id,
+          channel: command.channel ?? "main",
+          resp_headers: selectedResponseHeaders(response),
+          resp_code: response.status,
+          resp_type: "session_termination_response",
+        });
+      },
     );
-
-    await deliver(command, {
-      request_id: command.request_id,
-      channel: command.channel ?? "main",
-      resp_headers: selectedResponseHeaders(response),
-      resp_code: response.status,
-      resp_type: "session_termination_response",
-    });
   } catch (error) {
     if (signal?.aborted || error instanceof ResponseDeliveryError) throw error;
     console.error(
@@ -284,7 +288,7 @@ function canonicalHeaderName(name) {
     .join("-");
 }
 
-async function fetchLocalResponse(url, init, deadlineAt, signal, readBody) {
+async function withLocalResponse(url, init, deadlineAt, signal, consume) {
   signal?.throwIfAborted();
   const remainingMs = deadlineAt === undefined ? undefined : deadlineAt - Date.now();
   if (remainingMs !== undefined && remainingMs <= 0) {
@@ -298,16 +302,22 @@ async function fetchLocalResponse(url, init, deadlineAt, signal, readBody) {
     ? undefined
     : setTimeout(() => controller.abort(), remainingMs);
   timer?.unref?.();
+  const checkActive = () => {
+    signal?.throwIfAborted();
+    controller.signal.throwIfAborted();
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      controller.abort();
+      controller.signal.throwIfAborted();
+    }
+  };
   let response;
   try {
     response = await fetch(url, { ...init, signal: controller.signal });
-    // Fetch resolves at headers. Keep the deadline active until the body has
-    // finished too, otherwise a stalled JSON/SSE body can occupy a worker forever.
-    const body = readBody ? await response.text() : undefined;
-    return { response, body };
+    checkActive();
+    // The deadline remains active through JSON or incremental SSE consumption,
+    // including time spent delivering an intermediate progress notification.
+    return await consume(response, checkActive);
   } finally {
-    // Notifications and DELETE acknowledgements do not use a response body.
-    // Release it before delivery, including when it never reaches EOF.
     await response?.body?.cancel().catch(() => {});
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);

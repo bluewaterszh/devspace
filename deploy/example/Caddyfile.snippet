@@ -1,0 +1,11 @@
+# OpenAI / ChatGPT OAuth + MCP for all tunnels
+https://example.com:8550 {
+        tls /etc/caddy/certs/example.com_bundle.crt /etc/caddy/certs/example.com.key
+        reverse_proxy 127.0.0.1:18550
+}
+
+# Windows tunnel-client control plane for all tunnels
+https://example.com:8551 {
+        tls /etc/caddy/certs/example.com_bundle.crt /etc/caddy/certs/example.com.key
+        reverse_proxy 127.0.0.1:18551
+}

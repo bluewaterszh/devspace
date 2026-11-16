@@ -1,0 +1,23 @@
+# Adjust the service account, installation directory, and Node.js path for your deployment.
+[Unit]
+Description=DevSpace Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=devspace
+WorkingDirectory=/opt/devspace
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=128
+ExecStart=/usr/bin/node /opt/devspace/dist/relay-cli.js
+Restart=on-failure
+RestartSec=3
+Nice=5
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,240 @@
+# DevSpace browser tunnel client
+
+Standalone PoC client for networks where the enterprise proxy requires an
+interactive browser SSO/approval flow before external HTTPS requests are
+allowed.
+
+It deliberately does **not** implement or reverse-engineer the enterprise SSO.
+Instead:
+
+1. Node launches a dedicated persistent Chrome/Edge profile.
+2. The user completes the enterprise SSO/approval in that real browser.
+3. DevSpace control-plane requests (metadata, poll, response) run via browser
+   `fetch()`, so they inherit the browser's authenticated network context.
+4. Node forwards tunnel commands to the local Streamable HTTP MCP server.
+
+The DevSpace relay/server package remains independent.
+
+## Install
+
+Run in Git Bash / PowerShell from this directory:
+
+```bash
+npm install
+```
+
+Node 22.16+ is required. The PoC uses the installed Chrome or Edge; it does not
+download a Playwright browser.
+
+## Run
+
+Use the same script + per-instance env-file workflow as the original tunnel
+client.
+
+Create an instance env file:
+
+```bash
+cp devspace.env.example devspace-server-a.env
+```
+
+Edit `devspace-server-a.env` and set the SSH target plus tunnel settings:
+
+```bash
+SSH_HOST=<remote-host>
+SSH_PORT=22
+SSH_USER=<remote-user>
+SSH_PASSWORD=<remote-password>
+WORKDIR='/path/to/remote/workdir'
+
+SSH_MCP_TIMING=1
+SSH_GROUP=dev
+SSH_AUTH_MODE=password
+
+MCP_PORT=3010
+MCP_TOKEN='<local-mcp-token>'
+
+DEVSPACE_CONTROL_PLANE=https://example.com
+DEVSPACE_TUNNEL_TOKEN=<same tunnel token used by DevSpace>
+TUNNEL_ID=tunnel_<32-lowercase-hex>
+
+DEVSPACE_BROWSER=chrome
+```
+
+`MCP_URL` normally does not need to be set; it is derived as
+`http://127.0.0.1:$MCP_PORT/`.
+
+The browser client does not read `HTTP_PROXY` / `HTTPS_PROXY` and does not force
+a Playwright proxy. Chrome/Edge uses the normal Windows system proxy/PAC and
+enterprise browser networking, matching the user's normal browser behavior.
+
+First test only the browser-backed control-plane access:
+
+```bash
+./devspace-tunnelctl.sh probe devspace-server-a
+```
+
+The browser opens visibly. Complete the enterprise SSO/approval in the browser.
+No terminal confirmation is required: the client probes every few seconds and
+detects successful approval automatically.
+
+After the probe succeeds, start the full stack in the background:
+
+```bash
+./devspace-tunnelctl.sh start devspace-server-a
+```
+
+`start` first launches `ssh-mcp` with the SSH settings from the env file,
+then launches the browser-backed tunnel client. If `MCP_TOKEN` is configured,
+the browser client automatically sends the same bearer token to the local
+`ssh-mcp` endpoint.
+
+Lifecycle commands:
+
+```bash
+./devspace-tunnelctl.sh status devspace-server-a
+./devspace-tunnelctl.sh log devspace-server-a
+./devspace-tunnelctl.sh ssh-log devspace-server-a
+./devspace-tunnelctl.sh restart devspace-server-a
+./devspace-tunnelctl.sh stop devspace-server-a
+```
+
+Each instance uses its own files:
+
+```text
+devspace-server-a.env
+.devspace-server-a.ssh-mcp.pid
+.devspace-server-a.ssh-mcp.log
+.devspace-server-a.browser-tunnel.pid
+.devspace-server-a.browser-tunnel.log
+```
+
+The first run creates a dedicated persistent browser profile under
+`~/.devspace-browser-tunnel/<tunnel-id>`.
+
+The long-running client now treats that browser as a recoverable transport. If
+the Chrome/Edge window, browser context, or transport tab is closed, a watchdog
+relaunches the same persistent profile automatically. If the enterprise session
+has expired, the client keeps running and retries SSO recovery instead of
+exiting after one timeout. The default watchdog interval is 15 seconds and can
+be changed with:
+
+```bash
+DEVSPACE_BROWSER_WATCHDOG_SECONDS=15
+```
+
+To use Edge, set this in the env file:
+
+```bash
+DEVSPACE_BROWSER=msedge
+```
+
+SSO approval is auto-clicked by default. The client recognizes the current
+enterprise interstitial action `接受风险并访问` with highest priority, plus
+common positive actions such as Continue / Approve / Allow / Sign in / 继续 /
+允许 / 授权 / 登录. Explicit negative actions such as Cancel / Deny / Back /
+取消 / 拒绝 / 返回 are never selected.
+
+To disable text-based auto approval:
+
+```bash
+DEVSPACE_SSO_AUTO_APPROVE=0
+```
+
+If a future SSO page needs an exact selector, it can still be configured:
+
+```bash
+DEVSPACE_SSO_APPROVE_SELECTOR='#approve-button'
+```
+
+During SSO recovery the client retries the selector/text match periodically, so
+an action that appears after a redirect or delayed page load is not missed.
+
+## Recovery behavior
+
+Set `DEVSPACE_CONTROL_PLANE` in each profile, or pass `--control-plane` when
+running the client directly. The client has no default public control-plane URL.
+
+Concurrent poll/response failures share one browser navigation and SSO recovery.
+Chrome network error pages and metadata fetch failures without a recognized
+login action return to the retry loop instead of waiting for SSO approval.
+A healthy login page can also produce a failed API probe during a cross-origin
+SSO redirect. The client allows one explicit login action in that case, or keeps
+the configured manual approval wait when automatic approval is disabled.
+Actual SSO pages still use the configured approval wait and auto-approval.
+
+A response rejected with HTTP 404 and `request_not_found` means the relay no
+longer has that request pending. The client logs `RESPONSE_NO_LONGER_PENDING`
+and stops all remaining responses for that command, including SSE notifications.
+It does not repeat the local MCP operation. Other 404 responses and authentication
+failures still follow the recovery path. Response delivery errors are reported
+separately from failures to reach the local MCP server.
+
+Control-plane requests have a client-side deadline across all CDP stages and
+the browser fetch, including its response body. Metadata and response delivery
+use 30 seconds; a poll allows its requested server wait plus 15 seconds (45
+seconds with the default poll wait). A timed-out CDP transport is invalidated
+so recovery can replace it; late replies cannot affect a replacement browser.
+
+Local MCP SSE events are decoded incrementally and progress is forwarded as it
+arrives. A matching final result or error ends the local stream immediately,
+without waiting for the server to close it. Expired requests and failed delivery
+also close the stream, including when a later event is already buffered.
+
+The local MCP deadline also covers response body reads and is checked after
+progress delivery before processing the next event. Unused notification
+and DELETE response bodies are cancelled. When the runtime delivers SIGINT or
+SIGTERM, the client cancels active local requests and starts browser cleanup
+immediately. Native Windows/Git Bash process signalling still needs verification
+on the target machine.
+
+## Diagnosing a stalled tunnel
+
+The CLI prefixes every log line with an ISO 8601 UTC timestamp (`Z`).
+Passive transport diagnostics are enabled by default. They do not change
+request deadlines, retry behavior, or browser recovery.
+
+Look for `TUNNEL_DIAG` records:
+
+- `request_start` / `request_end`: a local `op` number, request kind
+  (`poll`, `metadata`, or `response`), status, and elapsed time.
+- `heartbeat` every 30 seconds: main-loop state, active workers, pending
+  operations and their current stage (`get_frame_tree`, `create_world`,
+  or `evaluate`), time since the last poll returned, and the latest network
+  event. `tick_gap_ms` much larger than 30000 means Node's timer was delayed;
+  it does not by itself distinguish process starvation from machine sleep.
+- `network_request`, `network_response`, `network_finished`, and
+  `network_failed`: Chrome's network events for this tunnel only.
+  Response records include HTTP status, protocol, a local connection number,
+  and whether Chrome reused the connection. Network errors retain only
+  `net::ERR_*` codes. Redirects record status without the destination URL.
+
+If heartbeats continue with `phase=evaluate` but no network response, inspect
+the browser/network path. If Chrome reports a response and download completion
+while the same poll operation remains pending, inspect the renderer/CDP
+completion path. A server access-log completion alone does not prove that the
+browser received the response. If `network_observer` is not `on`, missing
+network events cannot be used as evidence of a network stall.
+
+`op`, `net`, and `connection` are separate local counters, not server IDs.
+Do not assume an exact pairing between concurrently posted responses based
+only on their order. New diagnostic records omit URLs, headers, payloads,
+tokens, and original request/session IDs. Existing error/SSO messages still
+need review before sharing a complete log.
+
+Set `DEVSPACE_TUNNEL_DIAGNOSTICS=0` in the instance env file to disable
+transport diagnostics; timestamp prefixes remain enabled.
+
+On restart, the launcher retains one nonempty previous log for each process:
+`.<profile>.browser-tunnel.log.previous` and
+`.<profile>.ssh-mcp.log.previous`. Preserve these along with the current
+logs when reporting a fault; a later restart can replace the previous copy.
+These are plain JavaScript client changes: update this directory and restart
+the Windows client to activate them. No relay rebuild/restart is required.
+
+## Security design
+
+The tunnel bearer token is not exposed to the page's normal JavaScript.
+The client keeps a single visible browser tab and executes control-plane
+`fetch()` calls inside a Chrome isolated world attached to that tab.
+
+The enterprise SSO is still handled by the real browser context/profile.

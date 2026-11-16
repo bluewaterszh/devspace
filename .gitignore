@@ -4,3 +4,9 @@ releases/
 .devspace-dev/
 .env
 *.log
+*.log.previous
+client/browser-tunnel/*.env
+client/browser-tunnel/*.env.*
+!client/browser-tunnel/devspace.env.example
+client/browser-tunnel/.*.browser-tunnel.pid
+client/browser-tunnel/.*.ssh-mcp.pid

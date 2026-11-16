@@ -1,4 +1,2 @@
 #!/usr/bin/env node
-import { runEntrypoint } from "./run-entrypoint.js";
-
-await runEntrypoint("../src/cli.ts", "../dist/cli.js");
+await import("../dist/relay-cli.js");
